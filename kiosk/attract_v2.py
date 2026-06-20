@@ -12,7 +12,7 @@ Exits cleanly on SIGINT / SIGTERM and blanks the display.
 
 Env vars (all optional):
   CAM_SIGNAL_PATH   default /tmp/cam_state.json
-  FLIPDOT_PORT      default /dev/ttyUSB0
+  FLIPDOT_SERIAL    default /dev/ttyS0
   FLIPDOT_BAUD      default 57600
   CAM_STALE_SECS    max age of signal before treating as "no one there" (default 2.0)
   ATTRACT_POLL      loop interval in seconds (default 0.1)
@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 SIGNAL_PATH   = os.getenv("CAM_SIGNAL_PATH",  "/tmp/cam_state.json")
-SERIAL_PORT   = os.getenv("FLIPDOT_PORT",      "/dev/ttyUSB0")
+SERIAL_PORT   = os.getenv("FLIPDOT_SERIAL",    "/dev/ttyS0")
 BAUD_RATE     = int(os.getenv("FLIPDOT_BAUD",  "57600"))
 STALE_THRESH  = float(os.getenv("CAM_STALE_SECS", "2.0"))
 POLL_INTERVAL = float(os.getenv("ATTRACT_POLL", "0.1"))
