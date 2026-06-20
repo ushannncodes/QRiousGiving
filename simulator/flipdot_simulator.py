@@ -275,7 +275,7 @@ WEB_PAGE = """<!doctype html>
   </div>
 <script>
 const COLS = {cols}, ROWS = {rows};
-const DOT = 16, GAP = 5, CELL = DOT + GAP;
+const DOT = 17, GAP = 2, CELL = DOT + GAP;
 const canvas = document.getElementById("panel");
 canvas.width = COLS * CELL;
 canvas.height = ROWS * CELL;
