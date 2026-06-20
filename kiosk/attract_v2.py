@@ -22,7 +22,6 @@ Env vars (all optional):
 """
 
 import json
-import math
 import os
 import time
 import logging
@@ -79,11 +78,23 @@ def _to_canvas(pt):
     return (x / FRAME_W) * DISPLAY_W, (y / FRAME_H) * DISPLAY_H
 
 
-def _draw_silhouette(landmarks: dict) -> Image.Image:
-    """Head + torso trapezoid from pose landmarks, scaled/positioned from
-    the person's actual tracked body. Falls back gracefully as landmarks
-    drop out: extrapolates hips below the shoulders if missing, extrapolates
-    the head above the shoulder midpoint if the nose isn't visible."""
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _draw_silhouette(landmarks: dict, bbox: dict | None) -> Image.Image:
+    """Stylized head + torso trapezoid, positioned from the person's
+    tracked shoulders/hips but *sized* off the overall detection bbox
+    height rather than literal shoulder width.
+
+    Real shoulder-width-to-height proportions are too narrow to read as
+    "a person" at 28x28 — e.g. a real ~4%-of-frame shoulder span renders
+    as a ~1px-wide sliver. bbox height is a much more stable reference
+    (one box vs. two individually-noisy landmarks), and the proportions
+    below are deliberately exaggerated (like the old static icon was) so
+    the shape stays legible at any distance, while still tracking the
+    person's real position/size live rather than snapping between presets.
+    """
     canvas = _blank_frame()
 
     lsh = _clean_point(tuple(landmarks.get("lshoulder", (0, 0))))
@@ -92,26 +103,46 @@ def _draw_silhouette(landmarks: dict) -> Image.Image:
         return canvas  # not enough signal to draw anything meaningful
 
     lsh_c, rsh_c = _to_canvas(lsh), _to_canvas(rsh)
-    shoulder_w = math.hypot(rsh_c[0] - lsh_c[0], rsh_c[1] - lsh_c[1])
     mid_sh = ((lsh_c[0] + rsh_c[0]) / 2, (lsh_c[1] + rsh_c[1]) / 2)
+
+    if bbox and bbox.get("height"):
+        body_h = (bbox["height"] / FRAME_H) * DISPLAY_H
+    else:
+        body_h = DISPLAY_H * 0.6
+    body_h = _clamp(body_h, 6.0, float(DISPLAY_H))
 
     lhip = _clean_point(tuple(landmarks.get("lhip", (0, 0))))
     rhip = _clean_point(tuple(landmarks.get("rhip", (0, 0))))
     if lhip and rhip:
-        lhip_c, rhip_c = _to_canvas(lhip), _to_canvas(rhip)
+        mid_hip = _to_canvas(lhip)
+        rhip_c = _to_canvas(rhip)
+        mid_hip = ((mid_hip[0] + rhip_c[0]) / 2, (mid_hip[1] + rhip_c[1]) / 2)
     else:
-        torso_h = shoulder_w * 1.4
-        lhip_c = (lsh_c[0], lsh_c[1] + torso_h)
-        rhip_c = (rsh_c[0], rsh_c[1] + torso_h)
+        mid_hip = (mid_sh[0], mid_sh[1] + body_h * 0.55)
+
+    top_y, bot_y = mid_sh[1], mid_hip[1]
+    if bot_y - top_y < 3.0:
+        bot_y = top_y + max(3.0, body_h * 0.5)
+    cx_top, cx_bot = mid_sh[0], mid_hip[0]
+
+    torso_top_w = _clamp(body_h * 0.42, 5.0, 16.0)
+    torso_bot_w = torso_top_w * 0.85
+    head_r = _clamp(body_h * 0.20, 2.2, 6.0)
 
     draw = ImageDraw.Draw(canvas)
-    draw.polygon([lsh_c, rsh_c, rhip_c, lhip_c], fill=0)
+    draw.polygon(
+        [
+            (cx_top - torso_top_w / 2, top_y),
+            (cx_top + torso_top_w / 2, top_y),
+            (cx_bot + torso_bot_w / 2, bot_y),
+            (cx_bot - torso_bot_w / 2, bot_y),
+        ],
+        fill=0,
+    )
 
-    nose = _clean_point(tuple(landmarks.get("nose", (0, 0))))
-    head_c = _to_canvas(nose) if nose else (mid_sh[0], mid_sh[1] - shoulder_w * 0.6)
-    head_r = max(1.0, shoulder_w * 0.32)
+    head_cx, head_cy = cx_top, top_y - head_r * 1.2
     draw.ellipse(
-        [head_c[0] - head_r, head_c[1] - head_r, head_c[0] + head_r, head_c[1] + head_r],
+        [head_cx - head_r, head_cy - head_r, head_cx + head_r, head_cy + head_r],
         fill=0,
     )
 
@@ -170,17 +201,19 @@ def main() -> None:
         state     = _read_state()
         active    = False
         landmarks = None
+        bbox      = None
 
         if state:
             age = time.time() - state.get("ts", 0)
             if age < STALE_THRESH and state.get("active", False):
                 active    = True
                 landmarks = state.get("landmarks")
+                bbox      = state.get("bbox")
 
         if active and landmarks:
             # Continuously redraw — the shape varies every frame as the
             # person moves, unlike the old fixed-size icons.
-            _send_frame(ser, _draw_silhouette(landmarks))
+            _send_frame(ser, _draw_silhouette(landmarks, bbox))
             was_active = True
         elif was_active:
             _send_frame(ser, _blank_frame())

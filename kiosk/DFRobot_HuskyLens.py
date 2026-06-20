@@ -24,6 +24,67 @@ from dfrobot_huskylensv2 import (  # noqa: E402
 )
 
 
+# ProtocolV2.wait() blocks for up to 8000ms per call waiting for a clean
+# I2C response before giving up — fine for a single quick read, but with
+# pose recognition's much larger landmark payload, an occasional I2C
+# hiccup means cam_v2.py's whole poll loop stalls for up to 8 real
+# seconds (observed live: cam_state.json's timestamp freezing for ~8s at
+# a stretch, which blanks the attract display since it looks stale).
+# Same retry/give-up behavior, just fails fast instead of hanging.
+_WAIT_TIMEOUT_MS = 500
+
+
+def _fast_wait(self, command):
+    receiving = True
+    self.receive_buffer = bytearray(1024)
+    self.receive_index = _vendor.HEADER_0_INDEX
+    start_ms = time.time_ns() // 1_000_000
+    while receiving:
+        now_ms = time.time_ns() // 1_000_000
+        if now_ms - start_ms > _WAIT_TIMEOUT_MS:
+            break
+        c = self._read_from_huskyLens()
+        if c is None:
+            time.sleep(0.01)
+            continue
+        if self.husky_lens_protocol_receive(c):
+            receiving = False
+    if receiving:
+        return False, [], []
+    if command != self.receive_buffer[_vendor.COMMAND_INDEX]:
+        return False, [], []
+    retInt = []
+    retStr = []
+    if command != _vendor.COMMAND_RETURN_ARGS:
+        return True, [], []
+
+    totalIntArgs = self.receive_buffer[_vendor.CONTENT_INDEX]
+    contentSize = self.receive_buffer[_vendor.CONTENT_SIZE_INDEX]
+    contentEnd = _vendor.CONTENT_INDEX + contentSize
+    retValue = self.receive_buffer[_vendor.CONTENT_INDEX + 1]
+    offset = _vendor.CONTENT_INDEX + 2
+    for _ in range(totalIntArgs):
+        v = self.receive_buffer[offset] | (self.receive_buffer[offset + 1] << 8)
+        retInt.append(v)
+        offset += 2
+
+    offset = _vendor.CONTENT_INDEX + 10
+    while offset < contentEnd:
+        length = self.receive_buffer[offset]
+        if length == 0:
+            break
+        offset += 1
+        if offset + length > contentEnd:
+            break
+        s = bytes(self.receive_buffer[offset:offset + length]).decode("utf-8")
+        retStr.append(s)
+        offset += length
+    return retValue == 0, retInt, retStr
+
+
+_vendor.ProtocolV2.wait = _fast_wait
+
+
 def _safe_face_result_init(self, buf):
     # Per HuskyLens2_Protocol.md, a face block's 20-byte eye/nose/mouth
     # landmark payload is appended after the name/content fields and should
