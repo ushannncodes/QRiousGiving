@@ -20,6 +20,7 @@ from dfrobot_huskylensv2 import (  # noqa: E402
     HuskylensV2_UART,
     ALGORITHM_FACE_RECOGNITION,
     ALGORITHM_HAND_RECOGNITION,
+    ALGORITHM_POSE_RECOGNITION,
 )
 
 
@@ -112,6 +113,46 @@ def _safe_hand_result_init(self, buf):
 _vendor.HandResult.__init__ = _safe_hand_result_init
 
 
+# Same fields PoseResult.__init__ parses (see vendor/dfrobot_huskylensv2.py).
+_POSE_FIELDS = [
+    ("nose_x", 0), ("nose_y", 2),
+    ("leye_x", 4), ("leye_y", 6),
+    ("reye_x", 8), ("reye_y", 10),
+    ("lear_x", 12), ("lear_y", 14),
+    ("rear_x", 16), ("rear_y", 18),
+    ("lshoulder_x", 20), ("lshoulder_y", 22),
+    ("rshoulder_x", 24), ("rshoulder_y", 26),
+    ("lelbow_x", 28), ("lelbow_y", 30),
+    ("relbow_x", 32), ("relbow_y", 34),
+    ("lwrist_x", 36), ("lwrist_y", 38),
+    ("rwrist_x", 40), ("rwrist_y", 42),
+    ("lhip_x", 44), ("lhip_y", 46),
+    ("rhip_x", 48), ("rhip_y", 50),
+    ("lknee_x", 52), ("lknee_y", 54),
+    ("rknee_x", 56), ("rknee_y", 58),
+    ("lankle_x", 60), ("lankle_y", 62),
+    ("rankle_x", 64), ("rankle_y", 66),
+]
+
+POSE_LANDMARK_NAMES = [name[:-2] for name, off in _POSE_FIELDS if name.endswith("_x")]
+
+
+def _safe_pose_result_init(self, buf):
+    # Same truncated-payload issue as FaceResult/HandResult above —
+    # best-effort instead of fatal so one bad read doesn't kill the poll loop.
+    _vendor.Result.__init__(self, buf)
+    base = _vendor.CONTENT_INDEX + 12 + self.nameLength + self.contentLength
+    for name, offset in _POSE_FIELDS:
+        try:
+            value = _vendor.read_u16(buf, base + offset)
+        except IndexError:
+            value = 0
+        setattr(self, name, value)
+
+
+_vendor.PoseResult.__init__ = _safe_pose_result_init
+
+
 class _Block:
     def __init__(self, result):
         self.width = result.width
@@ -132,6 +173,19 @@ class _HandBlock(_Block):
             (getattr(result, f"{name}_x"), getattr(result, f"{name}_y"))
             for name in HAND_LANDMARK_NAMES
         ]
+
+
+class _PoseBlock(_Block):
+    """Bbox plus named body landmarks (nose, l/rshoulder, l/rhip, etc.) as
+    a dict of (x, y) pixel-coordinate pairs — raw sensor pixels, same
+    caveat as _HandBlock (no reported working resolution)."""
+
+    def __init__(self, result):
+        super().__init__(result)
+        self.landmarks = {
+            name: (getattr(result, f"{name}_x"), getattr(result, f"{name}_y"))
+            for name in POSE_LANDMARK_NAMES
+        }
 
 
 class _HuskyLensAdapter:
@@ -158,7 +212,12 @@ class _HuskyLensAdapter:
 
     def blocks(self):
         n = self.count_blocks()
-        wrapper = _HandBlock if self._algo == ALGORITHM_HAND_RECOGNITION else _Block
+        if self._algo == ALGORITHM_HAND_RECOGNITION:
+            wrapper = _HandBlock
+        elif self._algo == ALGORITHM_POSE_RECOGNITION:
+            wrapper = _PoseBlock
+        else:
+            wrapper = _Block
         return [
             wrapper(self._hl.getCachedResultByIndex(self._algo, i))
             for i in range(n)

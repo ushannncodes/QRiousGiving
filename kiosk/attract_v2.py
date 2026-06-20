@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """attract_v2.py — Silhouette attract display for QRiousGiving v2.
 
-Reads /tmp/cam_state.json (written by cam_v2.py). When a face is detected
-the flipdot shows a person silhouette scaled to their apparent distance:
-  far  (face < 15 % of frame width) → 14×14 px centred on the 28×28 display
-  mid  (15–35 %)                    → 20×20 px
-  close (> 35 %)                    → full 28×28 px
+Reads /tmp/cam_state.json (written by cam_v2.py). While a person is
+detected, draws a live silhouette from their HuskyLens pose landmarks
+(nose, shoulders, hips) — head + torso trapezoid, sized and positioned
+from their actual tracked body each frame — instead of a fixed icon.
 
 Runs as a long-lived subprocess managed by run_kiosk / orchestrator.
 Exits cleanly on SIGINT / SIGTERM and blanks the display.
@@ -16,18 +15,21 @@ Env vars (all optional):
   FLIPDOT_BAUD      default 57600
   CAM_STALE_SECS    max age of signal before treating as "no one there" (default 2.0)
   ATTRACT_POLL      loop interval in seconds (default 0.1)
-  HUSKYLENS_FRAME_W HuskyLens sensor frame width in px (default 320)
+  HUSKYLENS_FRAME_W reference scale for landmark pixel coordinates (default 480) —
+  HUSKYLENS_FRAME_H HuskyLens doesn't report its working resolution, these are an
+                     empirical approximation used only for proportions, not a hard
+                     calibration; retune if the silhouette looks mis-scaled.
 """
 
 import json
+import math
 import os
 import time
 import logging
 import signal as _signal
 
 import serial
-import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -37,7 +39,8 @@ SERIAL_PORT   = os.getenv("FLIPDOT_SERIAL",    "/dev/ttyS0")
 BAUD_RATE     = int(os.getenv("FLIPDOT_BAUD",  "57600"))
 STALE_THRESH  = float(os.getenv("CAM_STALE_SECS", "2.0"))
 POLL_INTERVAL = float(os.getenv("ATTRACT_POLL", "0.1"))
-FRAME_W       = int(os.getenv("HUSKYLENS_FRAME_W", "320"))
+FRAME_W       = int(os.getenv("HUSKYLENS_FRAME_W", "480"))
+FRAME_H       = int(os.getenv("HUSKYLENS_FRAME_H", "480"))
 
 DISPLAY_W   = 28
 DISPLAY_H   = 28
@@ -46,78 +49,73 @@ PANEL_H     = 7   # rows per panel
 # Panel addresses — must match your hardware. Same order as qr_works.py.
 PANEL_ADDRS = [0x00, 0x01, 0x02, 0x03]
 
-# ── Silhouette bitmap ────────────────────────────────────────────────────────
-# 28 × 28, row-major.  1 = person pixel (renders as dark/flipped dot),
-#                       0 = background  (renders as white/unflipped dot).
-SILHOUETTE = [
-    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],  #  0 top pad
-    [0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0],  #  1 head
-    [0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0],  #  2
-    [0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0],  #  3
-    [0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0],  #  4
-    [0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0],  #  5
-    [0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0],  #  6 neck
-    [0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0],  #  7
-    [0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0],  #  8 shoulders
-    [0,0,0,1,1,1,0,0,0,1,1,1,1,1,1,1,1,1,1,0,0,0,1,1,1,0,0,0],  #  9 arms+torso
-    [0,0,0,1,1,1,0,0,0,1,1,1,1,1,1,1,1,1,1,0,0,0,1,1,1,0,0,0],  # 10
-    [0,0,0,0,1,1,0,0,0,1,1,1,1,1,1,1,1,1,1,0,0,0,1,1,0,0,0,0],  # 11
-    [0,0,0,0,1,1,0,0,0,1,1,1,1,1,1,1,1,1,1,0,0,0,1,1,0,0,0,0],  # 12
-    [0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0],  # 13 torso
-    [0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0],  # 14
-    [0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0],  # 15
-    [0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0],  # 16
-    [0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0],  # 17 hips
-    [0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0],  # 18
-    [0,0,0,0,0,0,0,0,1,1,1,1,1,0,0,1,1,1,1,1,0,0,0,0,0,0,0,0],  # 19 legs
-    [0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0],  # 20
-    [0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0],  # 21
-    [0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0],  # 22
-    [0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0],  # 23
-    [0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0],  # 24
-    [0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0],  # 25
-    [0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0],  # 26
-    [0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0],  # 27 feet
-]
-
-# Precompute PIL image from bitmap (28×28, L mode).
-# 1 (person) → pixel 0 (black) → bit 0 → dark dot on display.
-# 0 (background) → pixel 255 (white) → bit 1 → white dot on display.
-_BASE_SILHOUETTE_IMG = Image.fromarray(
-    np.array([[0 if v else 255 for v in row] for row in SILHOUETTE], dtype=np.uint8),
-    mode="L",
-)
-
-
-def _make_frame(target_px: int) -> Image.Image:
-    """Scale the silhouette to target_px × target_px, centred on a white 28×28 canvas."""
-    scaled = _BASE_SILHOUETTE_IMG.resize((target_px, target_px), Image.NEAREST)
-    canvas = Image.new("L", (DISPLAY_W, DISPLAY_H), 255)
-    off = (DISPLAY_W - target_px) // 2
-    canvas.paste(scaled, (off, off))
-    return canvas
+# Max plausible raw landmark coordinate. HuskyLens occasionally returns a
+# bit-corrupted value under I2C timing pressure (same transport issue
+# already worked around for Face/Hand results in DFRobot_HuskyLens.py) —
+# seen live as e.g. nose=(33194, 178) instead of ~(440, 178). Anything past
+# this is treated as "not detected" rather than drawn.
+MAX_COORD = 2000
 
 
 def _blank_frame() -> Image.Image:
     return Image.new("L", (DISPLAY_W, DISPLAY_H), 255)
 
 
-# Precompute the three silhouette sizes to avoid runtime resizing.
-_FRAMES = {
-    0:  _blank_frame(),
-    14: _make_frame(14),
-    20: _make_frame(20),
-    28: _make_frame(28),
-}
+def _clean_point(pt):
+    """(0, 0) means HuskyLens didn't report this landmark; reject
+    out-of-range values too (transport glitch, see MAX_COORD)."""
+    if not pt:
+        return None
+    x, y = pt
+    if x == 0 and y == 0:
+        return None
+    if not (0 <= x <= MAX_COORD and 0 <= y <= MAX_COORD):
+        return None
+    return (x, y)
 
 
-def _target_px(face_w: int) -> int:
-    ratio = face_w / FRAME_W
-    if ratio < 0.15:
-        return 14
-    if ratio < 0.35:
-        return 20
-    return 28
+def _to_canvas(pt):
+    x, y = pt
+    return (x / FRAME_W) * DISPLAY_W, (y / FRAME_H) * DISPLAY_H
+
+
+def _draw_silhouette(landmarks: dict) -> Image.Image:
+    """Head + torso trapezoid from pose landmarks, scaled/positioned from
+    the person's actual tracked body. Falls back gracefully as landmarks
+    drop out: extrapolates hips below the shoulders if missing, extrapolates
+    the head above the shoulder midpoint if the nose isn't visible."""
+    canvas = _blank_frame()
+
+    lsh = _clean_point(tuple(landmarks.get("lshoulder", (0, 0))))
+    rsh = _clean_point(tuple(landmarks.get("rshoulder", (0, 0))))
+    if not (lsh and rsh):
+        return canvas  # not enough signal to draw anything meaningful
+
+    lsh_c, rsh_c = _to_canvas(lsh), _to_canvas(rsh)
+    shoulder_w = math.hypot(rsh_c[0] - lsh_c[0], rsh_c[1] - lsh_c[1])
+    mid_sh = ((lsh_c[0] + rsh_c[0]) / 2, (lsh_c[1] + rsh_c[1]) / 2)
+
+    lhip = _clean_point(tuple(landmarks.get("lhip", (0, 0))))
+    rhip = _clean_point(tuple(landmarks.get("rhip", (0, 0))))
+    if lhip and rhip:
+        lhip_c, rhip_c = _to_canvas(lhip), _to_canvas(rhip)
+    else:
+        torso_h = shoulder_w * 1.4
+        lhip_c = (lsh_c[0], lsh_c[1] + torso_h)
+        rhip_c = (rsh_c[0], rsh_c[1] + torso_h)
+
+    draw = ImageDraw.Draw(canvas)
+    draw.polygon([lsh_c, rsh_c, rhip_c, lhip_c], fill=0)
+
+    nose = _clean_point(tuple(landmarks.get("nose", (0, 0))))
+    head_c = _to_canvas(nose) if nose else (mid_sh[0], mid_sh[1] - shoulder_w * 0.6)
+    head_r = max(1.0, shoulder_w * 0.32)
+    draw.ellipse(
+        [head_c[0] - head_r, head_c[1] - head_r, head_c[0] + head_r, head_c[1] + head_r],
+        fill=0,
+    )
+
+    return canvas
 
 
 def _image_to_panels(img: Image.Image) -> list[bytearray]:
@@ -164,24 +162,29 @@ def main() -> None:
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
     time.sleep(0.1)
 
-    last_target = -1  # force first write
+    was_active = False
 
     while running:
         t0 = time.time()
 
-        state      = _read_state()
-        target_px  = 0  # blank
+        state     = _read_state()
+        active    = False
+        landmarks = None
 
         if state:
             age = time.time() - state.get("ts", 0)
             if age < STALE_THRESH and state.get("active", False):
-                face_w    = state.get("face_w", 0)
-                target_px = _target_px(face_w) if face_w > 0 else 28
+                active    = True
+                landmarks = state.get("landmarks")
 
-        if target_px != last_target:
-            _send_frame(ser, _FRAMES[target_px])
-            last_target = target_px
-            log.debug("silhouette size → %d px", target_px)
+        if active and landmarks:
+            # Continuously redraw — the shape varies every frame as the
+            # person moves, unlike the old fixed-size icons.
+            _send_frame(ser, _draw_silhouette(landmarks))
+            was_active = True
+        elif was_active:
+            _send_frame(ser, _blank_frame())
+            was_active = False
 
         time.sleep(max(0, POLL_INTERVAL - (time.time() - t0)))
 
