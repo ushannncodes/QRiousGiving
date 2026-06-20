@@ -51,7 +51,12 @@ def connect():
         hl = DFRobot_HuskyLens_UART(baud=BAUD, uart_addr=PORT)
 
     for attempt in range(10):
-        if hl.begin():
+        try:
+            ok = hl.begin()
+        except Exception as e:
+            ok = False
+            log.warning("HuskyLens connection error: %s", e)
+        if ok:
             log.info("HuskyLens 2 connected (%s)", "I2C" if USE_I2C else f"UART {PORT}")
             hl.write_algo(ALGORITHM_FACE_RECOGNITION)
             return hl
