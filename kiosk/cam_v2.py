@@ -11,7 +11,7 @@ Env vars (all optional):
   HUSKYLENS_BAUD        default 9600
   HUSKYLENS_I2C         "1" = I2C (default), "0" = UART
   HUSKYLENS_I2C_BUS     default 1
-  HUSKYLENS_I2C_ADDR    default 0x32
+  HUSKYLENS_I2C_ADDR    default 0x50 (confirmed via i2cdetect on this unit)
   HUSKYLENS_FRAME_W     default 320  (sensor frame width in px)
   HUSKYLENS_FRAME_H     default 240
   POLL_INTERVAL         default 0.1 s
@@ -39,7 +39,7 @@ PORT          = os.getenv("HUSKYLENS_PORT",      "/dev/serial0")
 BAUD          = int(os.getenv("HUSKYLENS_BAUD",  "9600"))
 USE_I2C       = os.getenv("HUSKYLENS_I2C",       "1") == "1"
 I2C_BUS       = int(os.getenv("HUSKYLENS_I2C_BUS",  "1"))
-I2C_ADDR      = int(os.getenv("HUSKYLENS_I2C_ADDR", "0x32"), 16)
+I2C_ADDR      = int(os.getenv("HUSKYLENS_I2C_ADDR", "0x50"), 16)
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.1"))
 ACTIVE_FRAMES = int(os.getenv("ACTIVE_FRAMES",   "3"))
 
