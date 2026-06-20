@@ -17,9 +17,10 @@ hardware, e.g. in another terminal:
     export SERIAL_PORT=/tmp/flipdot_vserial       # anim.py, rand_anim/*.py
     python3 kiosk/attract_v2.py
 
-Rendering backend is auto-selected: a pygame window if a display is
-available, otherwise a curses terminal view. Force one with --gui or
---curses.
+Rendering backend defaults to a high-fidelity web view (open the printed
+http://127.0.0.1:5050 URL in a browser — works great through VSCode's
+auto port-forwarding over SSH/remote too). Force a different backend with
+--gui (pygame window) or --curses (terminal).
 
 Wire protocol (see attract_v2.py / qr_works.py _send_frame / build_packet):
     [0x80, 0x83, <panel addr>, <28 column bytes>, 0x8F]
@@ -32,6 +33,7 @@ import argparse
 import os
 import pty
 import select
+import signal
 import sys
 import threading
 import time
@@ -228,6 +230,126 @@ def run_curses(state: DisplayState, stop_evt: threading.Event):
     curses.wrapper(_main)
 
 
+WEB_PAGE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>flipdot simulator</title>
+<style>
+  html, body {
+    margin: 0; height: 100%;
+    background: radial-gradient(circle at 50% 0%, #d9d9d9, #b9b9b9);
+    display: flex; align-items: center; justify-content: center;
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  .frame {
+    background: linear-gradient(155deg, #e7cfa0, #cba669);
+    border-radius: 6px;
+    padding: 26px;
+    box-shadow: 0 25px 60px rgba(0,0,0,0.35), 0 2px 0 rgba(255,255,255,0.4) inset;
+  }
+  .mat {
+    background: #fafaf8;
+    padding: 28px 28px 18px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.25) inset;
+  }
+  .led {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: #222; margin: 0 auto 14px;
+  }
+  canvas { display: block; }
+  .caption {
+    text-align: center; margin-top: 10px;
+    font-size: 12px; letter-spacing: 0.06em; color: #8a8a86;
+    text-transform: uppercase;
+  }
+</style>
+</head>
+<body>
+  <div class="frame">
+    <div class="mat">
+      <div class="led"></div>
+      <canvas id="panel"></canvas>
+      <div class="caption" id="caption">0 frames received</div>
+    </div>
+  </div>
+<script>
+const COLS = {cols}, ROWS = {rows};
+const DOT = 16, GAP = 5, CELL = DOT + GAP;
+const canvas = document.getElementById("panel");
+canvas.width = COLS * CELL;
+canvas.height = ROWS * CELL;
+const ctx = canvas.getContext("2d");
+
+function drawDot(x, y, on) {
+  const cx = x * CELL + CELL / 2;
+  const cy = y * CELL + CELL / 2;
+  const r = DOT / 2;
+  const grad = ctx.createRadialGradient(cx - r * 0.3, cy - r * 0.3, 1, cx, cy, r);
+  if (on) {
+    grad.addColorStop(0, "#3a3a3a");
+    grad.addColorStop(1, "#0a0a0a");
+  } else {
+    grad.addColorStop(0, "#ffffff");
+    grad.addColorStop(1, "#d9d6cd");
+  }
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fillStyle = grad;
+  ctx.fill();
+}
+
+function render(grid) {
+  ctx.fillStyle = "#161616";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  for (let y = 0; y < ROWS; y++) {
+    for (let x = 0; x < COLS; x++) {
+      drawDot(x, y, grid[y][x]);
+    }
+  }
+}
+
+async function poll() {
+  try {
+    const res = await fetch("/api/state");
+    const data = await res.json();
+    render(data.grid);
+    document.getElementById("caption").textContent = data.frames + " frames received";
+  } catch (e) {
+    // server not reachable yet; keep retrying
+  }
+  setTimeout(poll, 100);
+}
+poll();
+</script>
+</body>
+</html>
+"""
+
+
+def run_web(state: DisplayState, stop_evt: threading.Event, host: str, port: int):
+    import logging
+
+    from flask import Flask, jsonify, Response
+
+    app = Flask(__name__)
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
+    page = WEB_PAGE.replace("{cols}", str(DISPLAY_W)).replace("{rows}", str(DISPLAY_H))
+
+    @app.route("/")
+    def index():
+        return Response(page, mimetype="text/html")
+
+    @app.route("/api/state")
+    def api_state():
+        grid, _dirty, received = state.grid()
+        return jsonify({"grid": grid, "frames": received})
+
+    print(f"flipdot simulator: open http://{host}:{port} in a browser")
+    app.run(host=host, port=port, debug=False, use_reloader=False)
+
+
 def run_plain(state: DisplayState, stop_evt: threading.Event):
     print("flipdot simulator — no TTY/display detected, printing frames as they arrive (Ctrl-C to quit)")
     last_received = -1
@@ -243,10 +365,17 @@ def run_plain(state: DisplayState, stop_evt: threading.Event):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--web", action="store_true", help="force the web renderer (default)")
     ap.add_argument("--gui", action="store_true", help="force the pygame renderer")
     ap.add_argument("--curses", action="store_true", help="force the curses terminal renderer")
+    ap.add_argument("--host", default="127.0.0.1", help="web renderer bind address (default 127.0.0.1)")
+    ap.add_argument("--port", type=int, default=5050, help="web renderer port (default 5050)")
     ap.add_argument("--baud", type=int, default=57600, help="reported baud rate (cosmetic; pty ignores it)")
     args = ap.parse_args()
+
+    def _on_sigterm(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
     master_fd, slave_fd = pty.openpty()
     slave_path = os.ttyname(slave_fd)
@@ -276,16 +405,24 @@ def main():
     reader = threading.Thread(target=reader_thread, args=(master_fd, state, stop_evt), daemon=True)
     reader.start()
 
-    use_gui = args.gui or (not args.curses and bool(os.environ.get("DISPLAY")))
+    use_web = args.web or not (args.gui or args.curses)
+    use_gui = args.gui
 
     try:
-        if use_gui:
+        if use_web:
+            try:
+                run_web(state, stop_evt, args.host, args.port)
+            except ImportError:
+                print("flask not available, falling back to pygame/curses")
+                use_web = False
+                use_gui = use_gui or bool(os.environ.get("DISPLAY"))
+        if not use_web and use_gui:
             try:
                 run_pygame(state, stop_evt)
             except ImportError:
                 print("pygame not available, falling back to curses")
                 use_gui = False
-        if not use_gui:
+        if not use_web and not use_gui:
             if args.curses or sys.stdout.isatty():
                 run_curses(state, stop_evt)
             else:
