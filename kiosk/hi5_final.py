@@ -200,40 +200,37 @@ def fatal(msg: str):
     print(msg); sys.exit(1)
 
 # ============== Display I/O ==============
-driver_close_serial = None
+# Same panel protocol _send_one_frame_fast/_pack_28x28_to_panels above use
+# (qr_works.py / attract_v2.py / anim.py all speak it too):
+#   [0x80, 0x83, <panel addr>, <28 column bytes>, 0x8F] per panel.
+# This used to import a `flipdot_driver` module for this, but that file
+# lives in legacy/ (not on kiosk/'s import path) — the ImportError fallback
+# silently kicked in and sent a different, incompatible packet shape
+# instead, so nothing past the very first "HI" frame ever actually reached
+# a real panel. Just send the real protocol directly.
 try:
-    from flipdot_driver import send_frame_to_flipdot as _send
-    try:
-        from flipdot_driver import close_serial as driver_close_serial
-    except Exception:
-        driver_close_serial = None
-    def send_frame_to_flipdot(frame28: List[List[int]]):
-        _send(frame28)
-except ImportError:
-    try:
-        import serial
-    except Exception:
-        fatal("ERROR: pyserial missing.")
-    _ser = None
-    def _ensure_serial():
-        global _ser
-        if _ser is None or not _ser.is_open:
-            _ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        return _ser
-    def send_frame_to_flipdot(frame28: List[List[int]]):
-        s = _ensure_serial()
-        s.write(bytes([0x80, 0x01]))  # controller header (adjust if needed)
-        for x in range(WIDTH):
-            col_bits = 0
-            for y in range(HEIGHT):
-                col_bits |= (1 if frame28[y][x] else 0) << y
-            s.write(col_bits.to_bytes(4, "little"))
-        s.write(b"\xFF"); s.flush()
+    import serial
+except Exception:
+    fatal("ERROR: pyserial missing.")
+
+_ser = None
+def _ensure_serial():
+    global _ser
+    if _ser is None or not _ser.is_open:
+        _ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    return _ser
+
+def send_frame_to_flipdot(frame28: List[List[int]]):
+    s = _ensure_serial()
+    for addr, data in zip([1, 2, 3, 4], _pack_28x28_to_panels(frame28)):
+        s.write(bytearray([0x80, 0x83, addr]) + data + bytearray([0x8F]))
+    s.flush()
 
 def maybe_close_serial():
+    global _ser
     try:
-        if driver_close_serial:
-            driver_close_serial()
+        if _ser and _ser.is_open:
+            _ser.close()
     except Exception:
         pass
 
