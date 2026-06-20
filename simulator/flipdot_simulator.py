@@ -198,12 +198,28 @@ def run_curses(state: DisplayState, stop_evt: threading.Event):
                 grid = new_grid
                 stdscr.erase()
                 stdscr.addstr(0, 0, f"flipdot simulator — {received} frames received (q to quit)")
-                for y in range(DISPLAY_H):
+                # Pack two pixel rows into each terminal row via half-block
+                # glyphs. Terminal cells are roughly twice as tall as they
+                # are wide, so one char per column here keeps the 28x28
+                # grid square instead of needing 28 separate terminal rows
+                # (which is taller than most terminal panels and gets
+                # clipped at the bottom).
+                attr = (on_pair | curses.A_BOLD) if on_pair else 0
+                for y in range(0, DISPLAY_H, 2):
+                    top_row = grid[y]
+                    bottom_row = grid[y + 1] if y + 1 < DISPLAY_H else [False] * DISPLAY_W
                     for x in range(DISPLAY_W):
-                        ch_attr = (on_pair | curses.A_BOLD) if (on_pair and grid[y][x]) else 0
-                        symbol = "██" if grid[y][x] else "··"
+                        top, bottom = top_row[x], bottom_row[x]
+                        if top and bottom:
+                            symbol = "█"
+                        elif top:
+                            symbol = "▀"
+                        elif bottom:
+                            symbol = "▄"
+                        else:
+                            symbol = " "
                         try:
-                            stdscr.addstr(y + 2, x * 2, symbol, ch_attr)
+                            stdscr.addstr(y // 2 + 2, x, symbol, attr if (top or bottom) else 0)
                         except curses.error:
                             pass
                 stdscr.refresh()
