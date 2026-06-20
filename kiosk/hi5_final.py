@@ -14,32 +14,34 @@ Common env:
   SCROLL_STEP ("1"), SCROLL_DELAY ("0.1"), FONT_SPACING ("1")
   BIG_HI_PAUSE ("1.2"), TUI ("0")
 
-Palm detection (same knobs):
-  MIN_DET_CONF ("0.18"), MIN_TRACK_CONF ("0.15"), MAX_HANDS ("1")
-  ANGLE_PIP_THRESH_DEG ("130"), ANGLE_DIP_THRESH_DEG ("118"), DIST_MARGIN ("0.004")
+Palm detection — landmarks come from the HuskyLens's built-in
+ALGORITHM_HAND_RECOGNITION (camera hardware was swapped for the HuskyLens;
+see STATUS.md — this used to run Picamera2 + MediaPipe Hands, which has no
+camera to read from anymore). HuskyLens reports the same 21-point wrist-first
+landmark layout MediaPipe uses, so the open-palm geometry below is unchanged,
+just fed HuskyLens landmarks instead. Landmarks are raw sensor pixel
+coordinates (HuskyLens doesn't report its working resolution), so
+DIST_MARGIN/MIN_HAND_AREA are in pixel units now, not the old 0..1 fraction
+— defaults are a starting point, expect to retune on real hardware:
+  ANGLE_PIP_THRESH_DEG ("130"), ANGLE_DIP_THRESH_DEG ("118"), DIST_MARGIN ("3")
   RELAX_TWO_FINGERS ("1")
 
-Camera / ROI / timing / smoothing:
-  HFLIP ("0")
-  ROI_TOP_FRAC ("0.55"), ROI_BOTTOM_FRAC ("1.00")
+HuskyLens:
+  HUSKYLENS_I2C_BUS ("1"), HUSKYLENS_I2C_ADDR ("0x50")
+
+Timing / smoothing:
   LOOP_SLEEP_SEC ("0.03")
   HYST_ALPHA ("0.35"), HYST_THRESH ("0.35")
 
 Presence logic (NEW):
   ASSUME_OPEN_SEC ("5.0")     # presence ≥ this → treat as open palm
   IDLE_ABORT_SEC ("5.0")      # no presence ≥ this → exit to kiosk
-  USE_MOTION ("1")            # 1=enable motion-based presence
-  MOTION_ALPHA ("0.2")        # EMA strength for motion metric
-  MOTION_THRESH ("0.020")     # motion EMA threshold (0..1)
-  DS_W ("96"), DS_H ("72")    # downsample size for motion
 
 Fallbacks:
-  FALLBACK_ANY_HAND ("0")
   FALLBACK_BBOX ("1")
-  MIN_HAND_AREA ("0.04")
+  MIN_HAND_AREA ("5000")      # pixel-area of the landmark bbox, not a fraction
 
-MediaPipe:
-  MODEL_COMPLEXITY ("0")
+Palm asset:
   PALM_JSON (default: assets/palm_combo.json relative to this script)
 
 """
@@ -144,11 +146,6 @@ except Exception:
 
 from typing import List
 
-try:
-    import numpy as np
-except Exception:
-    np = None
-
 # ============== CONFIG ==============
 WIDTH, HEIGHT = 28, 28
 WHITE_VAL = int(os.getenv("WHITE_VAL", "1"))
@@ -172,16 +169,14 @@ TUI              = os.getenv("TUI", "0") == "1"
 # Palm gate
 ANGLE_PIP_THRESH_DEG = float(os.getenv("ANGLE_PIP_THRESH_DEG", "130"))
 ANGLE_DIP_THRESH_DEG = float(os.getenv("ANGLE_DIP_THRESH_DEG", "118"))
-DIST_MARGIN          = float(os.getenv("DIST_MARGIN", "0.004"))
-MIN_DET_CONF         = float(os.getenv("MIN_DET_CONF", "0.18"))
-MIN_TRACK_CONF       = float(os.getenv("MIN_TRACK_CONF", "0.15"))
-MAX_HANDS            = int(os.getenv("MAX_HANDS", "1"))
+DIST_MARGIN          = float(os.getenv("DIST_MARGIN", "3"))  # pixels, not 0..1 fraction
 RELAX_TWO_FINGERS    = os.getenv("RELAX_TWO_FINGERS", "1") == "1"
 
-# ROI / timing / smoothing
-HFLIP            = os.getenv("HFLIP", "0") == "1"
-ROI_TOP_FRAC     = float(os.getenv("ROI_TOP_FRAC", "0.55"))
-ROI_BOTTOM_FRAC  = float(os.getenv("ROI_BOTTOM_FRAC", "1.00"))
+# HuskyLens
+HUSKYLENS_I2C_BUS  = int(os.getenv("HUSKYLENS_I2C_BUS", "1"))
+HUSKYLENS_I2C_ADDR = int(os.getenv("HUSKYLENS_I2C_ADDR", "0x50"), 16)
+
+# Timing / smoothing
 LOOP_SLEEP_SEC   = float(os.getenv("LOOP_SLEEP_SEC", "0.03"))
 HYST_ALPHA       = float(os.getenv("HYST_ALPHA", "0.5"))#tighten this to a higher number
 HYST_THRESH      = float(os.getenv("HYST_THRESH", "0.5"))#tighten this to a higher number
@@ -189,20 +184,12 @@ HYST_THRESH      = float(os.getenv("HYST_THRESH", "0.5"))#tighten this to a high
 # Presence
 ASSUME_OPEN_SEC  = float(os.getenv("ASSUME_OPEN_SEC", "5.0"))
 IDLE_ABORT_SEC   = float(os.getenv("IDLE_ABORT_SEC", "30"))
-USE_MOTION       = os.getenv("USE_MOTION", "1") == "1"
-MOTION_ALPHA     = float(os.getenv("MOTION_ALPHA", "0.2"))
-MOTION_THRESH    = float(os.getenv("MOTION_THRESH", "0.020"))
-DS_W             = int(os.getenv("DS_W", "96"))
-DS_H             = int(os.getenv("DS_H", "72"))
 
 # Fallbacks
-FALLBACK_ANY_HAND = os.getenv("FALLBACK_ANY_HAND", "0") == "1"
 FALLBACK_BBOX     = os.getenv("FALLBACK_BBOX", "1") == "1"
-MIN_HAND_AREA     = float(os.getenv("MIN_HAND_AREA", "0.04"))
+MIN_HAND_AREA     = float(os.getenv("MIN_HAND_AREA", "5000"))  # pixel area, not a fraction
 
-# MediaPipe
 PALM_JSON         = os.getenv("PALM_JSON", os.path.join(SCRIPT_DIR, "..", "assets", "palm_combo.json"))
-MODEL_COMPLEXITY  = int(os.getenv("MODEL_COMPLEXITY", "0"))
 
 # Logging (NEW)
 DEBUG_LOG        = os.getenv("DEBUG_LOG", "1") == "1"
@@ -211,18 +198,6 @@ LOG_EVERY_MS     = int(os.getenv("LOG_EVERY_MS", "350"))   # throttle logs
 
 def fatal(msg: str):
     print(msg); sys.exit(1)
-
-# ============== Camera + Hands ==============
-# try:
-#     from picamera2 import Picamera2
-# except Exception:
-#     fatal("ERROR: Picamera2 not found.")
-
-# try:
-#     import mediapipe as mp
-#     mp_hands = mp.solutions.hands
-# except Exception:
-#     fatal("ERROR: mediapipe not found.")
 
 # ============== Display I/O ==============
 driver_close_serial = None
@@ -425,30 +400,27 @@ def compose_fill_frame_from_filled(outline, filled, cutoff_row: int):
 
 # ============== TUI ==============
 def tui_clear(): print("\x1b[2J\x1b[H", end="")
-def tui_print_preview(rgb_frame, detected: bool, progress: float, presence: bool):
-    if not TUI or np is None: return
-    h, w, _ = rgb_frame.shape
-    cols, rows = 48, 18
-    stepx = max(1, w // cols); stepy = max(1, h // rows)
-    palette = " .:-=+*#%@"
+def tui_print_preview(detected: bool, progress: float, presence: bool):
+    # No raw camera frame available (HuskyLens does on-device detection
+    # only) — just a status line + progress bar, no ASCII image.
+    if not TUI: return
     tui_clear()
     title = "HI-5!" if detected else ("(presence)" if presence else "…")
-    print("Camera (ASCII preview) —", title)
-    for ry in range(0, h, stepy):
-        if ry//stepy >= rows: break
-        line = []
-        for rx in range(0, w, stepx):
-            if rx//stepx >= cols: break
-            r,g,b = rgb_frame[ry, rx]
-            lum = (0.2126*r + 0.7152*g + 0.0722*b) / 255.0
-            ch = palette[int(lum*(len(palette)-1))]
-            line.append(ch)
-        print("".join(line))
+    print("HuskyLens hand tracking —", title)
     width = 30
     n = int(max(0.0, min(1.0, progress)) * width)
     print(f"\nHold progress: [{'='*n}{' '*(width-n)}]  {progress*100:4.0f}%")
 
 # ============== Hand + Presence helpers ==============
+class _LM:
+    """Minimal MediaPipe-landmark-shaped (.x/.y) point, fed from HuskyLens
+    HandResult landmarks so is_open_palm() etc. don't need to change."""
+    __slots__ = ("x", "y")
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
 def _dist(a, b): return math.hypot(a.x - b.x, a.y - b.y)
 
 def _angle_deg(a, b, c):
@@ -491,12 +463,6 @@ def _bbox_area_norm(lm):
     w = max(xs) - min(xs); h = max(ys) - min(ys)
     return w * h
 
-def _motion_metric(gray_small, prev_small, ema, alpha):
-    if prev_small is None: return ema, 0.0
-    diff = np.mean(np.abs(gray_small.astype(np.float32) - prev_small.astype(np.float32))) / 255.0
-    ema = (1.0 - alpha) * ema + alpha * diff
-    return ema, diff
-
 def _now_ms():
     return int(time.time() * 1000)
 
@@ -524,12 +490,6 @@ def main():
     else:
         scroll_list = MESSAGES
 
-    # if len(MESSAGES) > 0 and MESSAGES[0].strip().upper() == "HI":
-    #     send_frame_to_flipdot(compose_big_text_center("HI", max_scale=4))
-    #     time.sleep(BIG_HI_PAUSE)
-    #     scroll_list = MESSAGES[1:]
-    # else:
-    #     scroll_list = MESSAGES
     for msg in scroll_list:
         for frame in render_text_scroller_centered(msg, speed_cols_per_step=SCROLL_STEP):
             send_frame_to_flipdot(frame); time.sleep(SCROLL_DELAY)
@@ -539,26 +499,18 @@ def main():
     time.sleep(0.8)
     print(f"Palm prompt shown. Starting camera + detection… (hold {HOLD_REQUIRED_SEC:.1f}s)")
 
-    # --- Lazy imports: only load once we actually need the camera/hands ---
-    try:
-        from picamera2 import Picamera2
-    except Exception:
-        fatal("ERROR: Picamera2 not found.")
+    # --- Lazy import: only load once we actually need the sensor ---
+    from DFRobot_HuskyLens import DFRobot_HuskyLens_I2C, ALGORITHM_HAND_RECOGNITION
 
-    try:
-        import mediapipe as mp
-        mp_hands = mp.solutions.hands
-    except Exception:
-        fatal("ERROR: mediapipe not found.")
-
-    
-    # Camera
-    picam = Picamera2()
-    picam.configure(picam.create_preview_configuration(main={"format": "RGB888", "size": (640, 480)}))
-    picam.start()
-    try: picam.set_controls({"AeEnable": True, "AwbEnable": True})
-    except Exception: pass
-    time.sleep(0.3)
+    hl = DFRobot_HuskyLens_I2C(bus=HUSKYLENS_I2C_BUS, addr=HUSKYLENS_I2C_ADDR)
+    for attempt in range(10):
+        if hl.begin():
+            break
+        _log(f"[HI5] HuskyLens connect attempt {attempt + 1}/10 failed, retrying…")
+        time.sleep(1)
+    else:
+        fatal("ERROR: could not connect to HuskyLens.")
+    hl.write_algo(ALGORITHM_HAND_RECOGNITION)  # write_algo() settles for us
 
     hold_start = None
     satisfied = False
@@ -573,183 +525,121 @@ def main():
     last_reason = "idle"
     last_progress_pct = -1
 
+    while True:
+        try:
+            got = hl.request()
+        except Exception as e:
+            _log(f"[HI5] HuskyLens read error: {e}")
+            time.sleep(0.2)
+            continue
 
-    prev_small = None
-    motion_ema = 0.0
+        open_palm_now = False
+        hand_present_now = False
+        reason = "idle"
 
-    with mp_hands.Hands(static_image_mode=False,
-                        max_num_hands=MAX_HANDS,
-                        model_complexity=MODEL_COMPLEXITY,
-                        min_detection_confidence=MIN_DET_CONF,
-                        min_tracking_confidence=MIN_TRACK_CONF) as hands:
-        while True:
-            rgb = picam.capture_array()
-            if HFLIP and np is not None:
-                rgb = np.ascontiguousarray(rgb[:, ::-1, :])
-
-            h, w, _ = rgb.shape
-            top    = max(0, min(h-1, int(h * ROI_TOP_FRAC)))
-            bottom = max(top+1, min(h,   int(h * ROI_BOTTOM_FRAC)))
-            roi = rgb[top:bottom, :, :]
-
-            # ---- Hand landmarks (REPLACED: adds reason)
-            res = hands.process(roi)  # note: use ROI if you already cropped; else 'rgb'
-            open_palm_now = False
-            hand_present_now = False
-            reason = "idle"  # NEW: why are we 'open'?
-
-            if res.multi_hand_landmarks:
-                for hand in res.multi_hand_landmarks:
-                    hand_present_now = True
-                    lm = hand.landmark
-                    # Primary: palm geometry
-                    if is_open_palm(lm):
-                        open_palm_now = True
-                        reason = "palm_geom"
-                        break
-                    # Fallback: bbox area
-                    if not open_palm_now and FALLBACK_BBOX:
-                        if _bbox_area_norm(lm) >= MIN_HAND_AREA:
-                            open_palm_now = True
-                            reason = "bbox_fallback"
-                            break
-
-
-
-            # # ---- Hand landmarks
-            # res = hands.process(roi)
-            # open_palm_now = False
-            # hand_present_now = False
-            # if res.multi_hand_landmarks:
-            #     for hand in res.multi_hand_landmarks:
-            #         hand_present_now = True
-            #         lm = hand.landmark
-            #         if is_open_palm(lm):
-            #             open_palm_now = True
-            #             break
-            #         if not open_palm_now and FALLBACK_BBOX:
-            #             if _bbox_area_norm(lm) >= MIN_HAND_AREA:
-            #                 open_palm_now = True
-            #                 break
-
-
-            # ---- Motion presence (optional)
-            presence_by_motion = False
-            if USE_MOTION and np is not None:
-                small = roi if (roi.shape[1] <= DS_W and roi.shape[0] <= DS_H) else \
-                        np.ascontiguousarray(roi[::max(1, roi.shape[0]//DS_H), ::max(1, roi.shape[1]//DS_W), :])
-                # grayscale
-                gray = (0.2126*small[:,:,0] + 0.7152*small[:,:,1] + 0.0722*small[:,:,2]).astype(np.uint8)
-                motion_ema, _ = _motion_metric(gray, prev_small, motion_ema, MOTION_ALPHA)
-                presence_by_motion = motion_ema >= MOTION_THRESH
-                prev_small = gray
-
-            # ---- Presence decision
-            presence_now = hand_present_now or presence_by_motion
-            now = time.time()
-
-            PRESENCE_GRACE_SEC = float(os.getenv("PRESENCE_GRACE_SEC", "0.8"))
-            if presence_now:
-                last_presence_time = now
-            presence_now = presence_now or ((now - last_presence_time) <= PRESENCE_GRACE_SEC)
-
-            if presence_now:
-                last_presence_time = now
-                absence_run_start = None
-                if presence_run_start is None:
-                    presence_run_start = now
-            else:
-                presence_run_start = None
-                if absence_run_start is None:
-                    absence_run_start = now
-
-            presence_cont = (now - presence_run_start) if presence_run_start else 0.0
-            absence_cont  = (now - absence_run_start)  if absence_run_start  else 0.0
-
-            # # Auto-assume open if presence is steady long enough (NEW)
-            # if not open_palm_now and presence_cont >= ASSUME_OPEN_SEC:
-            #     open_palm_now = True
-            #     reason = "presence_auto_assume"
-
-            # Auto-assume only if we've seen a hand recently (guard against empty scene)
-            ALLOW_AUTO_ASSUME     = os.getenv("ALLOW_AUTO_ASSUME", "0") == "1" #change this to 1 if we want the safeguard to be ON
-            HAND_SEEN_WITHIN_SEC  = float(os.getenv("HAND_SEEN_WITHIN_SEC", "1.0"))
-            recent_hand_seen      = (now - last_seen_time) <= HAND_SEEN_WITHIN_SEC
-
-            if (ALLOW_AUTO_ASSUME
-                and not open_palm_now
-                and presence_cont >= ASSUME_OPEN_SEC
-                and recent_hand_seen):
+        if got and hl.count_blocks() > 0:
+            hand_present_now = True
+            block = hl.blocks()[0]  # largest/first hand only (MAX_HANDS=1 equivalent)
+            lm = [_LM(x, y) for x, y in block.landmarks]
+            # Primary: palm geometry
+            if is_open_palm(lm):
                 open_palm_now = True
-                reason = "presence_auto_assume"
+                reason = "palm_geom"
+            # Fallback: bbox area
+            elif FALLBACK_BBOX and _bbox_area_norm(lm) >= MIN_HAND_AREA:
+                open_palm_now = True
+                reason = "bbox_fallback"
 
+        # ---- Presence decision
+        presence_now = hand_present_now
+        now = time.time()
 
-            if hand_present_now:
-                last_seen_time = now
+        PRESENCE_GRACE_SEC = float(os.getenv("PRESENCE_GRACE_SEC", "0.8"))
+        if presence_now:
+            last_presence_time = now
+        presence_now = presence_now or ((now - last_presence_time) <= PRESENCE_GRACE_SEC)
 
-            # Smooth + grace
-            smoothed_hit = (1.0 - HYST_ALPHA) * smoothed_hit + HYST_ALPHA * (1.0 if open_palm_now else 0.0)
-            effective_open = (smoothed_hit > HYST_THRESH) or ((now - last_seen_time) <= MISS_GRACE_SEC)
+        if presence_now:
+            last_presence_time = now
+            absence_run_start = None
+            if presence_run_start is None:
+                presence_run_start = now
+        else:
+            presence_run_start = None
+            if absence_run_start is None:
+                absence_run_start = now
 
-            # ---- Throttled debug log (NEW)
-            if DEBUG_LOG:
-                now_ms = _now_ms()
-                if now_ms - last_log_ms >= LOG_EVERY_MS:
-                    # Rough progress estimate (human-friendly)
-                    if hold_start is not None and effective_open:
-                        approx_pct = int(min(100, 100 * (time.time() - hold_start) / HOLD_REQUIRED_SEC))
-                    else:
-                        approx_pct = 0
+        presence_cont = (now - presence_run_start) if presence_run_start else 0.0
+        absence_cont  = (now - absence_run_start)  if absence_run_start  else 0.0
 
-                    # Only print when reason changes OR progress moves
-                    if reason != last_reason or (effective_open and approx_pct != last_progress_pct):
-                        _log(
-                            f"[HI5] open={open_palm_now} eff_open={effective_open} "
-                            f"reason={reason} presence={presence_now} "
-                            f"presence_cont={presence_cont:.1f}s absence_cont={absence_cont:.1f}s "
-                            f"progress≈{approx_pct}%"
-                        )
-                        last_reason = reason
-                        last_progress_pct = approx_pct
-                        last_log_ms = now_ms
+        # Auto-assume only if we've seen a hand recently (guard against empty scene)
+        ALLOW_AUTO_ASSUME     = os.getenv("ALLOW_AUTO_ASSUME", "0") == "1" #change this to 1 if we want the safeguard to be ON
+        HAND_SEEN_WITHIN_SEC  = float(os.getenv("HAND_SEEN_WITHIN_SEC", "1.0"))
+        recent_hand_seen      = (now - last_seen_time) <= HAND_SEEN_WITHIN_SEC
 
+        if (ALLOW_AUTO_ASSUME
+            and not open_palm_now
+            and presence_cont >= ASSUME_OPEN_SEC
+            and recent_hand_seen):
+            open_palm_now = True
+            reason = "presence_auto_assume"
 
-            # ---- Idle abort: no humans for ≥ IDLE_ABORT_SEC → exit
-            if absence_cont >= IDLE_ABORT_SEC:
-                _log(f"[HI5] ABORT: no presence for {absence_cont:.1f}s → exit to kiosk")
-                picam.stop()
-                maybe_close_serial()
-                sys.exit(0)
+        if hand_present_now:
+            last_seen_time = now
 
-            # if absence_cont >= IDLE_ABORT_SEC:
-            #     print(f"[HI5] No presence for {absence_cont:.1f}s → exiting to kiosk.")
-            #     picam.stop()
-            #     maybe_close_serial()
-            #     sys.exit(0)
+        # Smooth + grace
+        smoothed_hit = (1.0 - HYST_ALPHA) * smoothed_hit + HYST_ALPHA * (1.0 if open_palm_now else 0.0)
+        effective_open = (smoothed_hit > HYST_THRESH) or ((now - last_seen_time) <= MISS_GRACE_SEC)
 
-            # ---- Render
-            if effective_open:
-                if hold_start is None:
-                    hold_start = now
-                elapsed = now - hold_start
-                progress = min(1.0, elapsed / HOLD_REQUIRED_SEC)
-                cutoff = HEIGHT - int(progress * HEIGHT)
-                if cutoff < 0: cutoff = 0
-                frame = compose_fill_frame_from_filled(outline_mask, filled_mask, cutoff)
-                send_frame_to_flipdot(frame)
-                if TUI: tui_print_preview(roi, True, progress, presence_now)
-                if progress >= 1.0:
-                    _log("[HI5] SUCCESS: filled to 100% — chaining to NEXT_SCRIPT")
-                    satisfied = True
-                    break
-            else:
-                hold_start = None
-                send_frame_to_flipdot(outline_frame)
-                if TUI: tui_print_preview(roi, False, 0.0, presence_now)
+        # ---- Throttled debug log (NEW)
+        if DEBUG_LOG:
+            now_ms = _now_ms()
+            if now_ms - last_log_ms >= LOG_EVERY_MS:
+                # Rough progress estimate (human-friendly)
+                if hold_start is not None and effective_open:
+                    approx_pct = int(min(100, 100 * (time.time() - hold_start) / HOLD_REQUIRED_SEC))
+                else:
+                    approx_pct = 0
 
-            time.sleep(LOOP_SLEEP_SEC)
+                # Only print when reason changes OR progress moves
+                if reason != last_reason or (effective_open and approx_pct != last_progress_pct):
+                    _log(
+                        f"[HI5] open={open_palm_now} eff_open={effective_open} "
+                        f"reason={reason} presence={presence_now} "
+                        f"presence_cont={presence_cont:.1f}s absence_cont={absence_cont:.1f}s "
+                        f"progress≈{approx_pct}%"
+                    )
+                    last_reason = reason
+                    last_progress_pct = approx_pct
+                    last_log_ms = now_ms
 
-    picam.stop()
+        # ---- Idle abort: no humans for ≥ IDLE_ABORT_SEC → exit
+        if absence_cont >= IDLE_ABORT_SEC:
+            _log(f"[HI5] ABORT: no presence for {absence_cont:.1f}s → exit to kiosk")
+            maybe_close_serial()
+            sys.exit(0)
+
+        # ---- Render
+        if effective_open:
+            if hold_start is None:
+                hold_start = now
+            elapsed = now - hold_start
+            progress = min(1.0, elapsed / HOLD_REQUIRED_SEC)
+            cutoff = HEIGHT - int(progress * HEIGHT)
+            if cutoff < 0: cutoff = 0
+            frame = compose_fill_frame_from_filled(outline_mask, filled_mask, cutoff)
+            send_frame_to_flipdot(frame)
+            if TUI: tui_print_preview(True, progress, presence_now)
+            if progress >= 1.0:
+                _log("[HI5] SUCCESS: filled to 100% — chaining to NEXT_SCRIPT")
+                satisfied = True
+                break
+        else:
+            hold_start = None
+            send_frame_to_flipdot(outline_frame)
+            if TUI: tui_print_preview(False, 0.0, presence_now)
+
+        time.sleep(LOOP_SLEEP_SEC)
 
     if satisfied:
         def compose_two_line_center_label(line1: str, line2: str, line_spacing: int = 2):

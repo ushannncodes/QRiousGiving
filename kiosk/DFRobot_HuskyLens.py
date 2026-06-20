@@ -10,6 +10,7 @@ than a copy of vendor code.
 
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 
@@ -18,6 +19,7 @@ from dfrobot_huskylensv2 import (  # noqa: E402
     HuskylensV2_I2C,
     HuskylensV2_UART,
     ALGORITHM_FACE_RECOGNITION,
+    ALGORITHM_HAND_RECOGNITION,
 )
 
 
@@ -52,12 +54,84 @@ def _safe_face_result_init(self, buf):
 _vendor.FaceResult.__init__ = _safe_face_result_init
 
 
+# Same fields HandResult.__init__ parses (see vendor/dfrobot_huskylensv2.py),
+# duplicated here so the best-effort override below doesn't need to reach
+# into the vendor class's closure.
+_HAND_FIELDS = [
+    ("wrist_x", 0), ("wrist_y", 2),
+    ("thumb_cmc_x", 4), ("thumb_cmc_y", 6),
+    ("thumb_mcp_x", 8), ("thumb_mcp_y", 10),
+    ("thumb_ip_x", 12), ("thumb_ip_y", 14),
+    ("thumb_tip_x", 16), ("thumb_tip_y", 18),
+    ("index_finger_mcp_x", 20), ("index_finger_mcp_y", 22),
+    ("index_finger_pip_x", 24), ("index_finger_pip_y", 26),
+    ("index_finger_dip_x", 28), ("index_finger_dip_y", 30),
+    ("index_finger_tip_x", 32), ("index_finger_tip_y", 34),
+    ("middle_finger_mcp_x", 36), ("middle_finger_mcp_y", 38),
+    ("middle_finger_pip_x", 40), ("middle_finger_pip_y", 42),
+    ("middle_finger_dip_x", 44), ("middle_finger_dip_y", 46),
+    ("middle_finger_tip_x", 48), ("middle_finger_tip_y", 50),
+    ("ring_finger_mcp_x", 52), ("ring_finger_mcp_y", 54),
+    ("ring_finger_pip_x", 56), ("ring_finger_pip_y", 58),
+    ("ring_finger_dip_x", 60), ("ring_finger_dip_y", 62),
+    ("ring_finger_tip_x", 64), ("ring_finger_tip_y", 66),
+    ("pinky_finger_mcp_x", 68), ("pinky_finger_mcp_y", 70),
+    ("pinky_finger_pip_x", 72), ("pinky_finger_pip_y", 74),
+    ("pinky_finger_dip_x", 76), ("pinky_finger_dip_y", 78),
+    ("pinky_finger_tip_x", 80), ("pinky_finger_tip_y", 82),
+]
+
+# MediaPipe's standard 21-point hand landmark order (wrist first, then each
+# finger base-to-tip) — matches HandResult's field order exactly, so callers
+# that already speak MediaPipe-shaped landmarks (lm[0]=wrist, lm[5..8]=index,
+# etc.) work unchanged against HuskyLens landmarks.
+HAND_LANDMARK_NAMES = [
+    "wrist",
+    "thumb_cmc", "thumb_mcp", "thumb_ip", "thumb_tip",
+    "index_finger_mcp", "index_finger_pip", "index_finger_dip", "index_finger_tip",
+    "middle_finger_mcp", "middle_finger_pip", "middle_finger_dip", "middle_finger_tip",
+    "ring_finger_mcp", "ring_finger_pip", "ring_finger_dip", "ring_finger_tip",
+    "pinky_finger_mcp", "pinky_finger_pip", "pinky_finger_dip", "pinky_finger_tip",
+]
+
+
+def _safe_hand_result_init(self, buf):
+    # Same truncated-payload issue as FaceResult above (seen live: a
+    # "bytearray index out of range" mid-session) — best-effort instead of
+    # fatal so one bad read doesn't kill the poll loop.
+    _vendor.Result.__init__(self, buf)
+    base = _vendor.CONTENT_INDEX + 12 + self.nameLength + self.contentLength
+    for name, offset in _HAND_FIELDS:
+        try:
+            value = _vendor.read_u16(buf, base + offset)
+        except IndexError:
+            value = 0
+        setattr(self, name, value)
+
+
+_vendor.HandResult.__init__ = _safe_hand_result_init
+
+
 class _Block:
     def __init__(self, result):
         self.width = result.width
         self.height = result.height
         self.x = result.xCenter - self.width // 2
         self.y = result.yCenter - self.height // 2
+
+
+class _HandBlock(_Block):
+    """Bbox plus the 21 hand landmarks, in MediaPipe's wrist-first order, as
+    (x, y) pixel-coordinate pairs (not normalized — HuskyLens doesn't report
+    its working resolution, so callers needing 0..1 space must pick their own
+    reference scale)."""
+
+    def __init__(self, result):
+        super().__init__(result)
+        self.landmarks = [
+            (getattr(result, f"{name}_x"), getattr(result, f"{name}_y"))
+            for name in HAND_LANDMARK_NAMES
+        ]
 
 
 class _HuskyLensAdapter:
@@ -69,7 +143,12 @@ class _HuskyLensAdapter:
 
     def write_algo(self, algo):
         self._algo = algo
-        return self._hl.switchAlgorithm(algo)
+        ok = self._hl.switchAlgorithm(algo)
+        # The sensor briefly drops off the bus while it switches models
+        # (observed: disappears from i2cdetect for a couple seconds) —
+        # give it time to settle before the next request.
+        time.sleep(2.0)
+        return ok
 
     def request(self):
         return self._hl.getResult(self._algo) is not None
@@ -79,8 +158,9 @@ class _HuskyLensAdapter:
 
     def blocks(self):
         n = self.count_blocks()
+        wrapper = _HandBlock if self._algo == ALGORITHM_HAND_RECOGNITION else _Block
         return [
-            _Block(self._hl.getCachedResultByIndex(self._algo, i))
+            wrapper(self._hl.getCachedResultByIndex(self._algo, i))
             for i in range(n)
         ]
 
