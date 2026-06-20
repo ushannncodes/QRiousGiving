@@ -13,11 +13,43 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 
+import dfrobot_huskylensv2 as _vendor  # noqa: E402
 from dfrobot_huskylensv2 import (  # noqa: E402
     HuskylensV2_I2C,
     HuskylensV2_UART,
     ALGORITHM_FACE_RECOGNITION,
 )
+
+
+def _safe_face_result_init(self, buf):
+    # Per HuskyLens2_Protocol.md, a face block's 20-byte eye/nose/mouth
+    # landmark payload is appended after the name/content fields and should
+    # be included in the packet's declared length. In practice (firmware
+    # quirk, or the chunked 32-byte I2C reads getting cut short under
+    # timing pressure) that payload is sometimes missing/truncated, which
+    # made the vendor's FaceResult.__init__ read past the buffer end and
+    # raise "bytearray index out of range" — crashing the whole poll loop.
+    # We only ever need the basic xCenter/yCenter/width/height bounding box
+    # (already parsed by Result.__init__ below), so make the landmark
+    # fields best-effort instead of fatal.
+    _vendor.Result.__init__(self, buf)
+    face_fields = [
+        ("leye_x", 0), ("leye_y", 2),
+        ("reye_x", 4), ("reye_y", 6),
+        ("nose_x", 8), ("nose_y", 10),
+        ("lmouth_x", 12), ("lmouth_y", 14),
+        ("rmouth_x", 16), ("rmouth_y", 18),
+    ]
+    base = _vendor.CONTENT_INDEX + 12 + self.nameLength + self.contentLength
+    for name, offset in face_fields:
+        try:
+            value = _vendor.read_u16(buf, base + offset)
+        except IndexError:
+            value = 0
+        setattr(self, name, value)
+
+
+_vendor.FaceResult.__init__ = _safe_face_result_init
 
 
 class _Block:
