@@ -10,7 +10,7 @@ Adds:
 Common env:
   WHITE_VAL ("1"), FLIPDOT_SERIAL ("/dev/ttyS0"), FLIPDOT_BAUD ("57600")
   HOLD_REQUIRED_SEC ("2.0"), MISS_GRACE_SEC ("0.8")
-  NEXT_SCRIPT ("/home/pi/Desktop/qr_works.py")
+  NEXT_SCRIPT (default: qr_works.py next to this script)
   SCROLL_STEP ("1"), SCROLL_DELAY ("0.1"), FONT_SPACING ("1")
   BIG_HI_PAUSE ("1.2"), TUI ("0")
 
@@ -40,7 +40,7 @@ Fallbacks:
 
 MediaPipe:
   MODEL_COMPLEXITY ("0")
-  PALM_JSON ("/home/pi/Desktop/palm_combo.json")
+  PALM_JSON (default: assets/palm_combo.json relative to this script)
 
 """
 # --- FAST FIRST FRAME: draw a big, centered "HI" immediately, then continue ---
@@ -157,9 +157,11 @@ BLACK_VAL = 1 - WHITE_VAL
 SERIAL_PORT = os.getenv("FLIPDOT_SERIAL", "/dev/ttyS0")
 BAUD_RATE   = int(os.getenv("FLIPDOT_BAUD", "57600"))
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 HOLD_REQUIRED_SEC = float(os.getenv("HOLD_REQUIRED_SEC", "2.0"))
-MISS_GRACE_SEC    = float(os.getenv("MISS_GRACE_SEC", "0")) #tighten this 
-NEXT_SCRIPT       = os.getenv("NEXT_SCRIPT", "/home/pi/Desktop/qr_works.py")
+MISS_GRACE_SEC    = float(os.getenv("MISS_GRACE_SEC", "0")) #tighten this
+NEXT_SCRIPT       = os.getenv("NEXT_SCRIPT", os.path.join(SCRIPT_DIR, "qr_works.py"))
 
 MESSAGES = ["HI","I AM A FUTURE DONATION MACHINE","TO LEARN MORE","HI-5"]
 SCROLL_STEP      = int(os.getenv("SCROLL_STEP", "1"))
@@ -199,7 +201,7 @@ FALLBACK_BBOX     = os.getenv("FALLBACK_BBOX", "1") == "1"
 MIN_HAND_AREA     = float(os.getenv("MIN_HAND_AREA", "0.04"))
 
 # MediaPipe
-PALM_JSON         = os.getenv("PALM_JSON", "/home/pi/Desktop/palm_combo.json")
+PALM_JSON         = os.getenv("PALM_JSON", os.path.join(SCRIPT_DIR, "..", "assets", "palm_combo.json"))
 MODEL_COMPLEXITY  = int(os.getenv("MODEL_COMPLEXITY", "0"))
 
 # Logging (NEW)

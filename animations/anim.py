@@ -1,6 +1,6 @@
 # run_show_with_countdown_and_thanks_static.py
 # 1) 5→1 countdown with ring (from anim_waves.py)
-# 2) run a single random script from ./rand_anim
+# 2) run a single random script from rand_anim/
 # 3) show static end card with:
 #       THANK
 #       YOU :)
@@ -8,6 +8,9 @@
 import os, time, math, random, subprocess, serial
 import numpy as np
 import argparse, glob
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSETS_DIR = os.path.join(SCRIPT_DIR, "..", "assets")
 
 
 # -----------------------------
@@ -249,7 +252,7 @@ def run_one_rand_script(force_pattern=None, remember_path="/tmp/last_rand_anim.t
     - If force_pattern is given (CLI --script or env FORCE_ANIM), it selects using glob.
     - Otherwise chooses randomly, avoiding the same script as last time (persisted in /tmp).
     """
-    folder = os.getenv("RAND_ANIM_DIR", "./rand_anim")
+    folder = os.getenv("RAND_ANIM_DIR", os.path.join(SCRIPT_DIR, "rand_anim"))
     if not os.path.isdir(folder):
         print(f"[RUN] No folder {folder}; skipping random anim.")
         return
@@ -289,7 +292,8 @@ def run_one_rand_script(force_pattern=None, remember_path="/tmp/last_rand_anim.t
     path = os.path.join(folder, choice)
     print(f"[RUN] Playing anim: {path}")
     try:
-        subprocess.run(["python3", "-u", path], check=False)
+        # cwd=ASSETS_DIR so the script's relative image lookups (e.g. sunflower.png) resolve
+        subprocess.run(["python3", "-u", path], check=False, cwd=ASSETS_DIR)
     finally:
         # remember even for forced runs, so next random won't immediately repeat it
         try:

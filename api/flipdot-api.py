@@ -8,8 +8,10 @@ API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("API_PORT", "8080"))
 TRIGGER_SECRET = os.getenv("TRIGGER_SECRET")  # optional; set both server & client
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Where anim.py lives (adjust if needed)
-ANIM_SCRIPT = os.getenv("ANIM_SCRIPT", "./anim.py")
+ANIM_SCRIPT = os.getenv("ANIM_SCRIPT", os.path.join(SCRIPT_DIR, "..", "animations", "anim.py"))
 
 # ---------------- Job System ----------------
 job_q = queue.Queue()

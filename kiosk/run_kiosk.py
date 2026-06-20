@@ -10,9 +10,10 @@ def _log_line(s: str):
         print(s)
 
 # ---------- Config (env-tweakable) ----------
-CAM_SCRIPT     = os.getenv("CAM_SCRIPT",     "./cam_v2.py")
-HI5_SCRIPT     = os.getenv("HI5_SCRIPT",     "./hi5_final.py")
-ATTRACT_SCRIPT = os.getenv("ATTRACT_SCRIPT", "./attract_v2.py")
+SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
+CAM_SCRIPT     = os.getenv("CAM_SCRIPT",     os.path.join(SCRIPT_DIR, "cam_v2.py"))
+HI5_SCRIPT     = os.getenv("HI5_SCRIPT",     os.path.join(SCRIPT_DIR, "hi5_final.py"))
+ATTRACT_SCRIPT = os.getenv("ATTRACT_SCRIPT", os.path.join(SCRIPT_DIR, "attract_v2.py"))
 
 CAM_SIGNAL_PATH     = os.getenv("CAM_SIGNAL_PATH", "/tmp/cam_state.json")
 TRIGGER_HOLD_SEC    = float(os.getenv("TRIGGER_HOLD_SEC", "8.0"))   # presence to promote -> HI5
