@@ -1,0 +1,5 @@
+pinpong==0.6.2
+pyserial==3.5
+
+# DFRobot_HuskylensV2 is not on PyPI; clone it separately:
+# git clone https://github.com/DFRobot/DFRobot_HuskylensV2.git
