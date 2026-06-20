@@ -1,54 +1,93 @@
 # v2 (HuskyLens) bring-up status — 2026-06-20
 
-Working notes from restructuring the repo and bringing the HuskyLens-based kiosk
-pipeline up on real hardware. Point a fresh chat at this file to resume without
-re-deriving everything.
+Working notes from bringing the HuskyLens-based kiosk pipeline up on real
+hardware. Point a fresh chat at this file to resume without re-deriving
+everything.
 
-## What's done (all on `v2`, pushed to `origin/v2`)
+## What's done (on `v2`, also mirrored onto `flip.simulator` and `main`)
 
-- Repo restructured: `kiosk/` (`run_kiosk.py`, `cam_v2.py`, `attract_v2.py`,
-  `hi5_final.py`, `qr_works.py`), `animations/` (`anim.py`, `rand_anim/`),
-  `api/` (`flipdot-api.py`), `assets/` (`palm_combo.json`, `sunflower.png`),
-  `legacy/` (everything dead/unreachable from the live pipeline — kept, not
-  deleted, in case old experiments are worth revisiting).
-- `cam_v2.py` imported `from DFRobot_HuskyLens import (...)`, a module that
-  didn't exist anywhere on this Pi. Added `kiosk/DFRobot_HuskyLens.py` (adapter)
-  + `kiosk/vendor/dfrobot_huskylensv2.py` (DFRobot's real client, vendored,
-  MIT licensed).
-- Fixed three real hardware-integration bugs found by actually running it on
-  the device:
-  - I2C address default was `0x32`; `i2cdetect -y 1` showed the sensor at
-    `0x50`. Fixed in `cam_v2.py`.
-  - `FaceResult` parsing crashed (`bytearray index out of range`) once a face
-    was actually detected — the vendor client expects a 20-byte eye/nose/mouth
-    landmark payload that isn't reliably present on this firmware/transport.
-    Patched in `kiosk/DFRobot_HuskyLens.py` to degrade gracefully (we don't use
-    those fields anyway, only the xCenter/yCenter/width/height bbox).
-  - `attract_v2.py` used a different env var (`FLIPDOT_PORT`) and default
-    (`/dev/ttyUSB0`) than the rest of the pipeline (`FLIPDOT_SERIAL` →
-    `/dev/ttyS0`, the only serial device that exists on this Pi). Aligned it.
+- Repo restructured (`kiosk/`, `animations/`, `api/`, `assets/`, `legacy/`)
+  — see `README.md`.
+- HuskyLens adapter (`kiosk/DFRobot_HuskyLens.py` + vendored
+  `kiosk/vendor/dfrobot_huskylensv2.py`) now supports face, hand, and pose
+  recognition, with a best-effort parser for all three — the vendor client
+  raises `bytearray index out of range` on a truncated/corrupted landmark
+  payload otherwise, seen live on all three algorithms — plus a 2s settle
+  delay after switching algorithms (the sensor drops off the I2C bus
+  briefly while switching models).
+- Fixed a real bug: `ProtocolV2.wait()` in the vendor client can block up
+  to 8 seconds per call waiting for a clean I2C response. Pose
+  recognition's larger payload made this stall `cam_v2.py`'s whole loop
+  for up to 8s at a stretch, intermittently blanking the attract display.
+  Shortened to 500ms.
+- `cam_v2.py` switched from `ALGORITHM_FACE_RECOGNITION` to
+  `ALGORITHM_POSE_RECOGNITION` — presence now triggers on a person's body
+  generally, not specifically a recognized face (closer to v1's old
+  "anything in front of the camera" behavior). Writes body landmarks
+  (nose/shoulders/hips/etc.) to `/tmp/cam_state.json` instead of a face
+  bbox.
+- `attract_v2.py` rewritten: instead of 3 fixed-size generic person icons,
+  it draws a live head+torso silhouette every frame from the actual
+  tracked landmarks. Sized off the overall detection bbox height rather
+  than literal shoulder width — real shoulder-width-to-height proportions
+  render as an unreadable ~1px sliver at 28x28; bbox height is a much more
+  stable reference.
+- `hi5_final.py` ported off Picamera2 + MediaPipe Hands (no camera hardware
+  left to read from — see "Explicitly out of scope" below) onto HuskyLens
+  `ALGORITHM_HAND_RECOGNITION`. HuskyLens's 21-point hand landmark layout
+  matches MediaPipe's exactly, so the existing open-palm geometry
+  (`is_open_palm`, finger-angle checks) didn't need to change.
+- Fixed a separate, pre-existing bug in `hi5_final.py`: it imported
+  `flipdot_driver`, which lives in `legacy/` (not on `kiosk/`'s import
+  path), so the `ImportError` fallback silently sent a completely
+  different, incompatible packet format for everything past the very
+  first frame. This likely never worked correctly even before this
+  session.
+- Added `simulator/flipdot_simulator.py` (on `flip.simulator` branch) — a
+  virtual flipdot panel (pty-based virtual serial port + web renderer) for
+  testing the whole pipeline without the physical panel. See `README.md`.
+- Added `README.md`; fixed `requirements.txt` (was missing
+  numpy/Pillow/qrcode/Flask/Flask-Cors/smbus2, listed unused `pinpong`,
+  had a stale "clone separately" note for an already-vendored dependency).
 
-## Verified on real hardware
+## Verified
 
-- `cam_v2.py` alone: connects over I2C, detects presence, writes
-  `/tmp/cam_state.json` correctly, survives sustained use (50+ sec, multiple
-  detections) without crashing.
-- `cam_v2.py` + `attract_v2.py` together under `run_kiosk.py`: both start and
-  stay running without crash-looping.
+- Hand recognition: real palm-geometry detection (`reason=palm_geom`)
+  against actual HuskyLens hardware, confirmed visually through the
+  simulator — correct flipdot packet rendering, hold-to-fill progress
+  tracking, idle-abort/reconnect.
+- Pose recognition: real body landmarks tracked live (nose/shoulders/hips
+  move correctly as the tracked person moves), confirmed through the
+  simulator after the 8s-stall and silhouette-proportion fixes — the
+  attract display now stays up continuously and renders a recognizable
+  head+torso shape instead of flickering/disappearing.
+- `qr_works.py`'s QR code renders correctly through the simulator (full
+  3-finder-pattern QR, confirms protocol/panel-stacking parsing).
 
 ## Not yet verified — pick up here
 
-- `attract_v2.py`'s actual silhouette draw on the flipdot panel. **The panel
-  was not physically connected during this session** — `/dev/ttyS0` opens
-  fine regardless (UART doesn't need an ACK), so no error, but nothing was
-  visually confirmed. Next: connect the panel, run `python3 kiosk/run_kiosk.py`,
-  stand in front of the camera, watch for a silhouette that scales with face
-  distance.
-- The full state-machine handoff: hold presence for `TRIGGER_HOLD_SEC` (8s,
-  env-tweakable) to trigger `hi5_final.py`, then `hi5_final.py`'s own
-  palm-fill game on real hardware.
-- `flipdot-api.py` + `anim.py` + `rand_anim/*.py` on real hardware — untouched
-  this session.
+- **Nothing this session was tested against the physical flipdot panel —
+  only `simulator/flipdot_simulator.py`** (real HuskyLens hardware +
+  simulated panel). Next: connect the real panel, rerun the same smoke
+  tests (`qr_works.py`, `attract_v2.py` while standing in front of the
+  camera, `hi5_final.py` palm fill) with `FLIPDOT_SERIAL=/dev/ttyS0`.
+- `hi5_final.py`'s palm-fill never reached 100% in testing — detection
+  flickers between open/closed (reached ~14% progress before resetting).
+  `HYST_ALPHA`/`HYST_THRESH`/`DIST_MARGIN`/`MIN_HAND_AREA` are already
+  flagged in the file as on-device tuning knobs; this is the next thing to
+  tune.
+- The full `run_kiosk.py` state-machine handoff (attract → hi-5 → QR →
+  animations → back to attract) hasn't been re-run end-to-end since
+  today's `cam_v2.py`/`attract_v2.py`/`hi5_final.py` rewrites — only the
+  individual scripts were tested standalone against the simulator.
+- `flipdot-api.py` + `anim.py` + `rand_anim/*.py` — untouched this
+  session, same as before.
+- HuskyLens occasionally returns a bit-corrupted landmark coordinate under
+  I2C timing pressure — seen on face, hand, *and* pose results (e.g.
+  `nose=(33194, 178)` instead of `~(440, 178)`). Each best-effort parser
+  treats fully-truncated payloads as zero, and `attract_v2.py` clamps
+  obviously-out-of-range values, but this is recurring transport-level
+  flakiness worth watching, not a one-off.
 
 ## Explicitly out of scope so far
 
@@ -57,6 +96,6 @@ Production at `/home/pi/Desktop` (systemd services `runkiosk.service`,
 v1's `cam_final.py`, and was crash-looping (`Picamera2()` IndexError — no Pi
 camera module found, since the hardware was swapped to the HuskyLens) before
 any of this work started. None of the above has been deployed there yet —
-that's a distinct step for whenever the v2 pipeline above is fully verified.
-Check `journalctl -u runkiosk.service` and `/etc/systemd/system/*.service` to
-re-orient if picking that up later.
+that's a distinct step for whenever the v2 pipeline is fully verified on
+real hardware. Check `journalctl -u runkiosk.service` and
+`/etc/systemd/system/*.service` to re-orient if picking that up later.
