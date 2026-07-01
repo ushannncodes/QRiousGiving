@@ -87,12 +87,21 @@ class DisplayState:
         self.panels = {}  # addr -> 28 bytes
         self.dirty = True
         self.frames_received = 0
+        self._seen_this_sweep = set()
 
     def apply(self, addr: int, data: bytes):
         with self.lock:
             self.panels[addr] = data
-            self.dirty = True
             self.frames_received += 1
+            self._seen_this_sweep.add(addr)
+            # Only flip dirty once every panel address has landed at least
+            # once since the last render — otherwise a poll can catch the
+            # display mid-write (e.g. 3 of 4 panels updated, 1 still holding
+            # the previous frame's bytes), which shows up as stray dots that
+            # belong to a different, already-superseded frame.
+            if len(self._seen_this_sweep) >= len(self.panels):
+                self.dirty = True
+                self._seen_this_sweep.clear()
 
     def grid(self):
         """Return 28x28 grid of bools (True = flipped/black dot)."""
@@ -348,6 +357,16 @@ def run_web(state: DisplayState, stop_evt: threading.Event, host: str, port: int
     def api_state():
         grid, _dirty, received = state.grid()
         return jsonify({"grid": grid, "frames": received})
+
+    @app.route("/restart", methods=["POST"])
+    def restart():
+        import threading as _t
+        def _do_restart():
+            import time as _time
+            _time.sleep(0.1)  # let the HTTP response flush
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        _t.Thread(target=_do_restart, daemon=True).start()
+        return jsonify({"ok": True, "msg": "restarting…"})
 
     print(f"flipdot simulator: open http://{host}:{port} in a browser")
     app.run(host=host, port=port, debug=False, use_reloader=False)

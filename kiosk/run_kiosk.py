@@ -13,10 +13,10 @@ def _log_line(s: str):
 SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 CAM_SCRIPT     = os.getenv("CAM_SCRIPT",     os.path.join(SCRIPT_DIR, "cam_v2.py"))
 HI5_SCRIPT     = os.getenv("HI5_SCRIPT",     os.path.join(SCRIPT_DIR, "hi5_final.py"))
-ATTRACT_SCRIPT = os.getenv("ATTRACT_SCRIPT", os.path.join(SCRIPT_DIR, "attract_v2.py"))
+ATTRACT_SCRIPT = os.getenv("ATTRACT_SCRIPT", os.path.join(SCRIPT_DIR, "attract_outline.py"))
 
 CAM_SIGNAL_PATH     = os.getenv("CAM_SIGNAL_PATH", "/tmp/cam_state.json")
-TRIGGER_HOLD_SEC    = float(os.getenv("TRIGGER_HOLD_SEC", "8.0"))   # presence to promote -> HI5
+TRIGGER_HOLD_SEC    = float(os.getenv("TRIGGER_HOLD_SEC", "20.0"))   # presence to promote -> HI5
 
 ACTIVE_STALE_SEC    = float(os.getenv("ACTIVE_STALE_SEC", "2.0"))   # heartbeat freshness from cam
 API_STATUS_URL      = os.getenv("API_STATUS_URL", "http://127.0.0.1:8080/status")
@@ -89,7 +89,7 @@ def _ensure_cam_stopped(cam_proc):
 def _ensure_attract_stopped(attract_proc):
     if _is_alive(attract_proc):
         _grace_stop(attract_proc)
-    _hard_kill(r"/attract_v2\.py")
+    _hard_kill(r"/attract_[a-z0-9_]+\.py")
     return None
 
 def _ensure_hi5_stopped(hi5_proc):
@@ -124,6 +124,11 @@ def main():
     cam = hi5 = attract = None
     hold_t0 = warmup_t0 = None
     print("[KIOSK] boot…")
+    # Remove stale cam_state.json so an old active=True can't instantly trigger hi5
+    try:
+        os.remove(CAM_SIGNAL_PATH)
+    except FileNotFoundError:
+        pass
 
     # WAIT state bookkeeping (set on entry)
     pre_anim_mode = True           # True = grace applies; False = grace killed (override)

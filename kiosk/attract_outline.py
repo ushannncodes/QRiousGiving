@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
-"""attract_v2.py — Silhouette attract display for QRiousGiving v2.
+"""attract_outline.py — Option 6: dashed-outline attract display.
 
-Reads /tmp/cam_state.json (written by cam_v2.py). While a person is
-detected, draws a live silhouette from their HuskyLens pose landmarks
-(nose, shoulders, hips) — head + torso trapezoid, sized and positioned
-from their actual tracked body each frame — instead of a fixed icon.
+Reads /tmp/cam_state.json (written by cam_v2.py), same as attract_v2.py.
+Reuses attract_v2.py's torso-trapezoid + head-circle geometry (sized off
+the tracked bbox/shoulders/hips), but instead of a solid fill, draws only
+a broken/dashed outline — like a quick line sketch rather than a filled
+coloring-book shape. Should read as much less "chunky" at 28x28.
 
-Runs as a long-lived subprocess managed by run_kiosk / orchestrator.
-Exits cleanly on SIGINT / SIGTERM and blanks the display.
-
-Env vars (all optional):
+Env vars (all optional, same names as attract_v2.py where applicable):
   CAM_SIGNAL_PATH   default /tmp/cam_state.json
   FLIPDOT_SERIAL    default /dev/ttyS0
   FLIPDOT_BAUD      default 57600
   CAM_STALE_SECS    max age of signal before treating as "no one there" (default 2.0)
   ATTRACT_POLL      loop interval in seconds (default 0.1)
-  HUSKYLENS_FRAME_W reference scale for landmark pixel coordinates (default 480) —
-  HUSKYLENS_FRAME_H HuskyLens doesn't report its working resolution, these are an
-                     empirical approximation used only for proportions, not a hard
-                     calibration; retune if the silhouette looks mis-scaled.
+  HUSKYLENS_FRAME_W reference scale for landmark pixel coordinates (default 480)
+  HUSKYLENS_FRAME_H same, height (default 480)
+  DASH_LEN          "on" segment length in display-units (default 1.4)
+  GAP_LEN           "off" segment length in display-units (default 1.0)
 """
 
 import json
+import math
 import os
 import time
 import logging
@@ -40,19 +39,15 @@ STALE_THRESH  = float(os.getenv("CAM_STALE_SECS", "2.0"))
 POLL_INTERVAL = float(os.getenv("ATTRACT_POLL", "0.1"))
 FRAME_W       = int(os.getenv("HUSKYLENS_FRAME_W", "480"))
 FRAME_H       = int(os.getenv("HUSKYLENS_FRAME_H", "480"))
+DASH_LEN      = float(os.getenv("DASH_LEN", "1.4"))
+GAP_LEN       = float(os.getenv("GAP_LEN", "1.0"))
 
 DISPLAY_W   = 28
 DISPLAY_H   = 28
 NUM_PANELS  = 4
-PANEL_H     = 7   # rows per panel
-# Panel addresses — must match your hardware. Same order as qr_works.py.
+PANEL_H     = 7
 PANEL_ADDRS = [0x01, 0x02, 0x03, 0x04]
 
-# Max plausible raw landmark coordinate. HuskyLens occasionally returns a
-# bit-corrupted value under I2C timing pressure (same transport issue
-# already worked around for Face/Hand results in DFRobot_HuskyLens.py) —
-# seen live as e.g. nose=(33194, 178) instead of ~(440, 178). Anything past
-# this is treated as "not detected" rather than drawn.
 MAX_COORD = 2000
 
 
@@ -61,8 +56,6 @@ def _blank_frame() -> Image.Image:
 
 
 def _clean_point(pt):
-    """(0, 0) means HuskyLens didn't report this landmark; reject
-    out-of-range values too (transport glitch, see MAX_COORD)."""
     if not pt:
         return None
     x, y = pt
@@ -82,25 +75,61 @@ def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
-def _draw_silhouette(landmarks: dict, bbox: dict | None) -> Image.Image:
-    """Stylized head + torso trapezoid, positioned from the person's
-    tracked shoulders/hips but *sized* off the overall detection bbox
-    height rather than literal shoulder width.
+STEP_LEN = 0.25  # fixed sampling step for dash rendering (display-units)
 
-    Real shoulder-width-to-height proportions are too narrow to read as
-    "a person" at 28x28 — e.g. a real ~4%-of-frame shoulder span renders
-    as a ~1px-wide sliver. bbox height is a much more stable reference
-    (one box vs. two individually-noisy landmarks), and the proportions
-    below are deliberately exaggerated (like the old static icon was) so
-    the shape stays legible at any distance, while still tracking the
-    person's real position/size live rather than snapping between presets.
-    """
+
+def _dashed_segment(draw: ImageDraw.ImageDraw, p0, p1, phase: float) -> float:
+    """Draw a dashed line from p0 to p1 by sampling at a fixed step and
+    plotting points that fall in the "on" part of the dash/gap cycle.
+    `phase` is the distance already consumed into that cycle by prior
+    segments (so dashes stay continuous around a multi-segment outline).
+    Returns the phase to carry into the next segment.
+
+    Sampling at a fixed step (rather than solving exact dash-boundary
+    crossings) avoids float-precision edge cases where the exact-boundary
+    approach could compute a near-zero step and loop effectively forever."""
+    x0, y0 = p0
+    x1, y1 = p1
+    length = math.hypot(x1 - x0, y1 - y0)
+    if length < 1e-6:
+        return phase
+    cycle = DASH_LEN + GAP_LEN
+    dx, dy = (x1 - x0) / length, (y1 - y0) / length
+    steps = max(1, int(length / STEP_LEN))
+    for i in range(steps + 1):
+        d = min(i * STEP_LEN, length)
+        if (phase + d) % cycle < DASH_LEN:
+            x, y = x0 + dx * d, y0 + dy * d
+            draw.point((x, y), fill=0)
+    return (phase + length) % cycle
+
+
+def _draw_dashed_polygon(draw: ImageDraw.ImageDraw, points: list, phase: float = 0.0) -> float:
+    for i in range(len(points)):
+        p0, p1 = points[i], points[(i + 1) % len(points)]
+        phase = _dashed_segment(draw, p0, p1, phase)
+    return phase
+
+
+def _draw_dashed_circle(draw: ImageDraw.ImageDraw, cx, cy, r, phase: float = 0.0) -> float:
+    circumference = 2 * math.pi * r
+    steps = max(8, int(circumference / 0.6))
+    pts = [
+        (cx + r * math.cos(2 * math.pi * i / steps), cy + r * math.sin(2 * math.pi * i / steps))
+        for i in range(steps)
+    ]
+    return _draw_dashed_polygon(draw, pts, phase)
+
+
+def _draw_outline(landmarks: dict, bbox: dict | None) -> Image.Image:
+    """Same body geometry as attract_v2._draw_silhouette, but rendered as a
+    dashed outline instead of a solid fill."""
     canvas = _blank_frame()
 
     lsh = _clean_point(tuple(landmarks.get("lshoulder", (0, 0))))
     rsh = _clean_point(tuple(landmarks.get("rshoulder", (0, 0))))
     if not (lsh and rsh):
-        return canvas  # not enough signal to draw anything meaningful
+        return canvas
 
     lsh_c, rsh_c = _to_canvas(lsh), _to_canvas(rsh)
     mid_sh = ((lsh_c[0] + rsh_c[0]) / 2, (lsh_c[1] + rsh_c[1]) / 2)
@@ -130,27 +159,55 @@ def _draw_silhouette(landmarks: dict, bbox: dict | None) -> Image.Image:
     head_r = _clamp(body_h * 0.20, 2.2, 6.0)
 
     draw = ImageDraw.Draw(canvas)
-    draw.polygon(
+    phase = _draw_dashed_polygon(
+        draw,
         [
             (cx_top - torso_top_w / 2, top_y),
             (cx_top + torso_top_w / 2, top_y),
             (cx_bot + torso_bot_w / 2, bot_y),
             (cx_bot - torso_bot_w / 2, bot_y),
         ],
-        fill=0,
     )
 
     head_cx, head_cy = cx_top, top_y - head_r * 1.2
-    draw.ellipse(
-        [head_cx - head_r, head_cy - head_r, head_cx + head_r, head_cy + head_r],
-        fill=0,
-    )
+    phase = _draw_dashed_circle(draw, head_cx, head_cy, head_r, phase)
+
+    for side, shoulder_c in (("l", lsh_c), ("r", rsh_c)):
+        phase = _draw_extended_arm(draw, landmarks, side, shoulder_c, cx_top, torso_top_w, top_y, bot_y, phase)
 
     return canvas
 
 
+# How far a wrist has to stray from the torso outline (in display-units)
+# before we treat the arm as "extended" and draw it, rather than just
+# resting at the person's side (where drawing it would just look noisy).
+ARM_EXTEND_MARGIN = 1.5
+
+
+def _draw_extended_arm(draw, landmarks, side, shoulder_c, cx_top, torso_top_w, top_y, bot_y, phase):
+    elbow = _clean_point(tuple(landmarks.get(f"{side}elbow", (0, 0))))
+    wrist = _clean_point(tuple(landmarks.get(f"{side}wrist", (0, 0))))
+    if not wrist:
+        return phase
+
+    wrist_c = _to_canvas(wrist)
+    outside_x = wrist_c[0] < cx_top - torso_top_w / 2 - ARM_EXTEND_MARGIN or \
+        wrist_c[0] > cx_top + torso_top_w / 2 + ARM_EXTEND_MARGIN
+    outside_y = wrist_c[1] < top_y - ARM_EXTEND_MARGIN or wrist_c[1] > bot_y + ARM_EXTEND_MARGIN
+    if not (outside_x or outside_y):
+        return phase  # arm at rest against the body — skip, avoid clutter
+
+    points = [shoulder_c]
+    if elbow:
+        points.append(_to_canvas(elbow))
+    points.append(wrist_c)
+
+    for i in range(len(points) - 1):
+        phase = _dashed_segment(draw, points[i], points[i + 1], phase)
+    return phase
+
+
 def _image_to_panels(img: Image.Image) -> list[bytearray]:
-    """Convert 28×28 PIL image to 4 panel byte arrays (28 bytes each, LSB = top row)."""
     pixels = img.load()
     panels = []
     for panel in range(NUM_PANELS):
@@ -159,7 +216,7 @@ def _image_to_panels(img: Image.Image) -> list[bytearray]:
         for x in range(DISPLAY_W):
             col_byte = 0
             for y in range(PANEL_H):
-                if pixels[x, y + y_off] == 255:  # white → bit 1
+                if pixels[x, y + y_off] == 255:
                     col_byte |= (1 << y)
             data[x] = col_byte
         panels.append(data)
@@ -183,13 +240,15 @@ def _read_state() -> dict | None:
 
 def main() -> None:
     running = True
+
     def _stop(sig, frame):
         nonlocal running
         running = False
-    _signal.signal(_signal.SIGINT,  _stop)
+
+    _signal.signal(_signal.SIGINT, _stop)
     _signal.signal(_signal.SIGTERM, _stop)
 
-    log.info("attract_v2: opening %s @ %d baud", SERIAL_PORT, BAUD_RATE)
+    log.info("attract_outline: opening %s @ %d baud", SERIAL_PORT, BAUD_RATE)
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
     time.sleep(0.1)
 
@@ -211,9 +270,7 @@ def main() -> None:
                 bbox      = state.get("bbox")
 
         if active and landmarks:
-            # Continuously redraw — the shape varies every frame as the
-            # person moves, unlike the old fixed-size icons.
-            _send_frame(ser, _draw_silhouette(landmarks, bbox))
+            _send_frame(ser, _draw_outline(landmarks, bbox))
             was_active = True
         elif was_active:
             _send_frame(ser, _blank_frame())
@@ -223,7 +280,7 @@ def main() -> None:
 
     _send_frame(ser, _blank_frame())
     ser.close()
-    log.info("attract_v2: exited cleanly")
+    log.info("attract_outline: exited cleanly")
 
 
 if __name__ == "__main__":

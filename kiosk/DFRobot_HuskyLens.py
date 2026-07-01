@@ -262,7 +262,7 @@ class _HuskyLensAdapter:
         # The sensor briefly drops off the bus while it switches models
         # (observed: disappears from i2cdetect for a couple seconds) —
         # give it time to settle before the next request.
-        time.sleep(2.0)
+        time.sleep(3.5)
         return ok
 
     def request(self):

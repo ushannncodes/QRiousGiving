@@ -156,8 +156,8 @@ BAUD_RATE   = int(os.getenv("FLIPDOT_BAUD", "57600"))
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-HOLD_REQUIRED_SEC = float(os.getenv("HOLD_REQUIRED_SEC", "2.0"))
-MISS_GRACE_SEC    = float(os.getenv("MISS_GRACE_SEC", "0")) #tighten this
+HOLD_REQUIRED_SEC = float(os.getenv("HOLD_REQUIRED_SEC", "1.5"))
+MISS_GRACE_SEC    = float(os.getenv("MISS_GRACE_SEC", "1.5"))
 NEXT_SCRIPT       = os.getenv("NEXT_SCRIPT", os.path.join(SCRIPT_DIR, "qr_works.py"))
 
 MESSAGES = ["HI","I AM A FUTURE DONATION MACHINE","TO LEARN MORE","HI-5"]
