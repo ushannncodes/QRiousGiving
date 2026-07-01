@@ -97,15 +97,18 @@ class DisplayState:
     def grid(self):
         """Return 28x28 grid of bools (True = flipped/black dot)."""
         with self.lock:
-            addrs = sorted(self.panels)[:NUM_PANELS]
-            panels = {addr: self.panels[addr] for addr in addrs}
+            panels = dict(self.panels)
             was_dirty = self.dirty
             self.dirty = False
             received = self.frames_received
         grid = [[False] * DISPLAY_W for _ in range(DISPLAY_H)]
-        for slot, addr in enumerate(sorted(panels)):
-            data = panels[addr]
-            y_off = slot * PANEL_H
+        for addr, data in panels.items():
+            # Use the address value directly as the row slot so that any
+            # stray frame with an unexpected address (e.g. addr 0 injected
+            # by the pty on open) doesn't shift the entire display down.
+            y_off = (addr - 1) * PANEL_H
+            if y_off < 0 or y_off + PANEL_H > DISPLAY_H:
+                continue  # ignore out-of-range addresses
             for x, col_byte in enumerate(data):
                 for y in range(PANEL_H):
                     bit = (col_byte >> y) & 1
