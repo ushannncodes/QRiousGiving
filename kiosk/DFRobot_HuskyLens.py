@@ -8,9 +8,12 @@ getCachedResultByIndex()), so this module is a thin translation layer rather
 than a copy of vendor code.
 """
 
+import logging
 import os
 import sys
 import time
+
+log = logging.getLogger(__name__)
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 
@@ -256,14 +259,41 @@ class _HuskyLensAdapter:
     def begin(self):
         return self._hl.begin()
 
-    def write_algo(self, algo):
+    def write_algo(self, algo, retries=14, settle=3.5):
+        # No reliable way to confirm the switch actually happened from
+        # software: switchAlgorithm()'s ack only means the command frame was
+        # received, not that the new model finished loading (observed: acks
+        # True on the first call, sensor's own screen stays on the old
+        # algorithm indefinitely). A prior attempt tried checking
+        # getResult(algo)'s response header (Result.algo) as "ground truth",
+        # but that field is just an echo of the algo byte *we* put in the
+        # request (see husky_lens_protocol_write_begin) — it always matches,
+        # so that check was a no-op that made cam_v2.py stop retrying after
+        # one attempt while the device was still on the wrong algorithm.
+        #
+        # Confirmed live (physical screen watched across repeated calls):
+        # a single switchAlgorithm() + settle does NOT reliably apply the
+        # switch, even after 20s. Re-issuing the command every ~4s across a
+        # ~30s window does eventually get it to take. So: brute-force
+        # re-issue on a generous budget instead of trusting any single ack.
         self._algo = algo
-        ok = self._hl.switchAlgorithm(algo)
-        # The sensor briefly drops off the bus while it switches models
-        # (observed: disappears from i2cdetect for a couple seconds) —
-        # give it time to settle before the next request.
-        time.sleep(3.5)
-        return ok
+        talked_to_sensor = False
+        for attempt in range(retries):
+            try:
+                self._hl.switchAlgorithm(algo)
+                talked_to_sensor = True
+            except Exception as e:
+                log.warning("switchAlgorithm attempt %d/%d raised: %s", attempt + 1, retries, e)
+            # The sensor briefly drops off the bus while it switches models
+            # (observed: disappears from i2cdetect for a couple seconds) —
+            # give it time to settle before the next request.
+            time.sleep(settle)
+        # Best-effort: we can't confirm the model actually loaded, only that
+        # we got at least one command frame through without the bus itself
+        # erroring out (total silence across every retry means something
+        # more fundamental than a slow model swap, e.g. the sensor dropped
+        # off entirely).
+        return talked_to_sensor
 
     def request(self):
         return self._hl.getResult(self._algo) is not None

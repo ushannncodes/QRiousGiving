@@ -66,7 +66,15 @@ def connect():
             log.warning("HuskyLens connection error: %s", e)
         if ok:
             log.info("HuskyLens 2 connected (%s)", "I2C" if USE_I2C else f"UART {PORT}")
-            hl.write_algo(ALGORITHM_POSE_RECOGNITION)
+            if not hl.write_algo(ALGORITHM_POSE_RECOGNITION):
+                # write_algo() already retried internally and verified against
+                # the device's actual reported algorithm — if it still says no,
+                # silently continuing would poll for pose landmarks the sensor
+                # was never actually producing (observed live: HuskyLens screen
+                # stuck showing the previous session's algorithm). Exit instead
+                # so run_kiosk.py's RUN_KIOSK loop respawns us for a fresh try.
+                log.error("HuskyLens never confirmed switching to pose recognition.")
+                sys.exit(1)
             return hl
         log.warning("Connection attempt %d/10 failed, retrying…", attempt + 1)
         time.sleep(1)

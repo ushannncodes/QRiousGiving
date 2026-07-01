@@ -252,6 +252,11 @@ def main() -> None:
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
     time.sleep(0.1)
 
+    # Reset to blank/white immediately so whatever the previous script left
+    # on the panel (last outline frame, old QR code, etc.) doesn't linger
+    # until the first person shows up.
+    _send_frame(ser, _blank_frame())
+
     was_active = False
 
     while running:

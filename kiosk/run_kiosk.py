@@ -16,7 +16,7 @@ HI5_SCRIPT     = os.getenv("HI5_SCRIPT",     os.path.join(SCRIPT_DIR, "hi5_final
 ATTRACT_SCRIPT = os.getenv("ATTRACT_SCRIPT", os.path.join(SCRIPT_DIR, "attract_outline.py"))
 
 CAM_SIGNAL_PATH     = os.getenv("CAM_SIGNAL_PATH", "/tmp/cam_state.json")
-TRIGGER_HOLD_SEC    = float(os.getenv("TRIGGER_HOLD_SEC", "20.0"))   # presence to promote -> HI5
+TRIGGER_HOLD_SEC    = float(os.getenv("TRIGGER_HOLD_SEC", "10.0"))   # presence to promote -> HI5
 
 ACTIVE_STALE_SEC    = float(os.getenv("ACTIVE_STALE_SEC", "2.0"))   # heartbeat freshness from cam
 API_STATUS_URL      = os.getenv("API_STATUS_URL", "http://127.0.0.1:8080/status")
@@ -80,10 +80,27 @@ def _hard_kill(pattern):
     except Exception:
         pass
 
+def _wait_for_pattern_gone(pattern, timeout=5.0):
+    # cam_v2.py's I2C reads can block in-kernel (uninterruptible D-state) —
+    # SIGKILL is only delivered once that syscall returns, so a killed
+    # process can keep holding the bus for a couple seconds after we think
+    # it's dead. hi5_final.py starting its own I2C traffic (SET_ALGORITHM)
+    # while cam_v2 is still mid-transaction was observed to corrupt/lose the
+    # algorithm switch silently (HuskyLens screen stayed on Pose Recognition
+    # even though the switch appeared to ack). Block here until the process
+    # is actually gone instead of assuming a signal was enough.
+    t0 = time.time()
+    while (time.time() - t0) < timeout:
+        r = subprocess.run(["pgrep", "-f", pattern], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if r.returncode != 0:  # no match => nothing left running
+            return
+        time.sleep(0.1)
+
 def _ensure_cam_stopped(cam_proc):
     if _is_alive(cam_proc):
         _grace_stop(cam_proc)
     _hard_kill(r"/cam_v2\.py")
+    _wait_for_pattern_gone(r"/cam_v2\.py")
     return None
 
 def _ensure_attract_stopped(attract_proc):
@@ -96,6 +113,12 @@ def _ensure_hi5_stopped(hi5_proc):
     if _is_alive(hi5_proc):
         _grace_stop(hi5_proc)
     _hard_kill(r"/hi5_final\.py")
+    # Same I2C-mid-transaction lingering risk as cam_v2.py (see
+    # _ensure_cam_stopped) — hi5_final.py's read loop can also block in
+    # uninterruptible D-state when force-killed (idle timeout, or an
+    # animation pre-empting it), and cam_v2.py connecting right after would
+    # race it back to POSE_RECOGNITION the same way.
+    _wait_for_pattern_gone(r"/hi5_final\.py")
     return None
 
 def _read_cam_state():

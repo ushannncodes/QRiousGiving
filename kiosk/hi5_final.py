@@ -507,7 +507,8 @@ def main():
         time.sleep(1)
     else:
         fatal("ERROR: could not connect to HuskyLens.")
-    hl.write_algo(ALGORITHM_HAND_RECOGNITION)  # write_algo() settles for us
+    if not hl.write_algo(ALGORITHM_HAND_RECOGNITION):
+        fatal("ERROR: HuskyLens never confirmed switching to hand recognition.")
 
     hold_start = None
     satisfied = False
