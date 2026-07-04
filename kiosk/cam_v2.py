@@ -109,7 +109,11 @@ def write_state(active, active_secs, pose=None):
     with open(tmp, "w") as f:
         json.dump(state, f)
         f.flush()
-        os.fsync(f.fileno())
+    # No os.fsync: this is a transient IPC state file rewritten ~10Hz, and on
+    # this Pi /tmp is on the SD card (ext4). os.replace() is an atomic rename,
+    # so the reader (attract_outline) always sees a complete file via the page
+    # cache without fsync — we don't need durability across power loss, and
+    # fsync'ing every loop only adds needless synchronous SD writes/wear.
     os.replace(tmp, SIGNAL_PATH)
 
 

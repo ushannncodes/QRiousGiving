@@ -259,41 +259,43 @@ class _HuskyLensAdapter:
     def begin(self):
         return self._hl.begin()
 
-    def write_algo(self, algo, retries=14, settle=3.5):
-        # No reliable way to confirm the switch actually happened from
-        # software: switchAlgorithm()'s ack only means the command frame was
-        # received, not that the new model finished loading (observed: acks
-        # True on the first call, sensor's own screen stays on the old
-        # algorithm indefinitely). A prior attempt tried checking
-        # getResult(algo)'s response header (Result.algo) as "ground truth",
-        # but that field is just an echo of the algo byte *we* put in the
-        # request (see husky_lens_protocol_write_begin) — it always matches,
-        # so that check was a no-op that made cam_v2.py stop retrying after
-        # one attempt while the device was still on the wrong algorithm.
+    def write_algo(self, algo, retries=4, settle=18.0, poll=0.3):
+        # switchAlgorithm()'s ack only means the command frame was received,
+        # not that the new model finished loading. After a switch the sensor
+        # drops off the bus and reloads the model, during which getResult()
+        # returns None; once the model is live it answers result queries again
+        # (measured on this unit: ~11-15s after a single switch, then steady).
         #
-        # Confirmed live (physical screen watched across repeated calls):
-        # a single switchAlgorithm() + settle does NOT reliably apply the
-        # switch, even after 20s. Re-issuing the command every ~4s across a
-        # ~30s window does eventually get it to take. So: brute-force
-        # re-issue on a generous budget instead of trusting any single ack.
+        # An earlier version brute-forced switchAlgorithm() every 3.5s for
+        # ~49s, but each re-issue RESTARTS the model reload — so hammering
+        # keeps pose perpetually in its unstable window and it only settles
+        # ~15s after the *last* switch (making warm-up ~60s+). Instead: switch
+        # once, then poll getResult() until the sensor starts answering (model
+        # live) and return immediately. Only re-issue the switch if it stays
+        # completely silent for the whole `settle` window, which means the
+        # switch didn't take (or the sensor dropped off entirely).
         self._algo = algo
-        talked_to_sensor = False
         for attempt in range(retries):
             try:
                 self._hl.switchAlgorithm(algo)
-                talked_to_sensor = True
             except Exception as e:
                 log.warning("switchAlgorithm attempt %d/%d raised: %s", attempt + 1, retries, e)
-            # The sensor briefly drops off the bus while it switches models
-            # (observed: disappears from i2cdetect for a couple seconds) —
-            # give it time to settle before the next request.
-            time.sleep(settle)
-        # Best-effort: we can't confirm the model actually loaded, only that
-        # we got at least one command frame through without the bus itself
-        # erroring out (total silence across every retry means something
-        # more fundamental than a slow model swap, e.g. the sensor dropped
-        # off entirely).
-        return talked_to_sensor
+
+            deadline = time.time() + settle
+            while time.time() < deadline:
+                try:
+                    if self._hl.getResult(algo) is not None:
+                        log.info("HuskyLens: %s live after switch attempt %d/%d",
+                                 "pose" if algo == ALGORITHM_POSE_RECOGNITION else algo,
+                                 attempt + 1, retries)
+                        return True
+                except Exception:
+                    pass
+                time.sleep(poll)
+
+            log.warning("HuskyLens: no result frames %.0fs after switch attempt %d/%d; re-issuing",
+                        settle, attempt + 1, retries)
+        return False
 
     def request(self):
         return self._hl.getResult(self._algo) is not None

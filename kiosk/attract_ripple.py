@@ -21,7 +21,10 @@ Env vars (all optional, same names as attract_v2.py where applicable):
   HUSKYLENS_FRAME_H same, height (default 480)
   RIPPLE_SPEED      ring growth, display-units/second (default 14.0)
   RIPPLE_INTERVAL   seconds between new ripples while active (default 0.6)
-  RIPPLE_WIDTH      ring thickness in display-units (default 0.9)
+  RIPPLE_WIDTH      ring thickness at spawn, display-units (default 2.0)
+  RIPPLE_WIDTH_MIN  ring thickness once fully thinned, display-units (default 0.7)
+  RIPPLE_FADE_FRAC  fraction of MAX_RADIUS over which width tapers to
+                     RIPPLE_WIDTH_MIN; smaller = thins out sooner (default 0.15)
 """
 
 import json
@@ -44,9 +47,11 @@ POLL_INTERVAL = float(os.getenv("ATTRACT_POLL", "0.1"))
 FRAME_W       = int(os.getenv("HUSKYLENS_FRAME_W", "480"))
 FRAME_H       = int(os.getenv("HUSKYLENS_FRAME_H", "480"))
 
-RIPPLE_SPEED    = float(os.getenv("RIPPLE_SPEED", "14.0"))
-RIPPLE_INTERVAL = float(os.getenv("RIPPLE_INTERVAL", "0.6"))
-RIPPLE_WIDTH    = float(os.getenv("RIPPLE_WIDTH", "0.9"))
+RIPPLE_SPEED     = float(os.getenv("RIPPLE_SPEED", "14.0"))
+RIPPLE_INTERVAL  = float(os.getenv("RIPPLE_INTERVAL", "0.6"))
+RIPPLE_WIDTH     = float(os.getenv("RIPPLE_WIDTH", "2.0"))
+RIPPLE_WIDTH_MIN = float(os.getenv("RIPPLE_WIDTH_MIN", "0.7"))
+RIPPLE_FADE_FRAC = float(os.getenv("RIPPLE_FADE_FRAC", "0.15"))
 
 DISPLAY_W   = 28
 DISPLAY_H   = 28
@@ -75,7 +80,10 @@ def _clean_point(pt):
 
 def _to_canvas(pt):
     x, y = pt
-    return (x / FRAME_W) * DISPLAY_W, (y / FRAME_H) * DISPLAY_H
+    # Mirror horizontally: the camera faces the viewer, so raw x increases
+    # to the viewer's left. Flipping x makes moving right make the ripple
+    # move right too, like a mirror reflection instead of camera footage.
+    return DISPLAY_W - (x / FRAME_W) * DISPLAY_W, (y / FRAME_H) * DISPLAY_H
 
 
 def _clamp(v, lo, hi):
@@ -109,11 +117,18 @@ def _draw_ripples(ripples: list[dict], now: float) -> Image.Image:
         radius = (now - r["born"]) * RIPPLE_SPEED
         if radius <= 0 or radius > MAX_RADIUS:
             continue
+        # Taper thickness from RIPPLE_WIDTH at spawn down to RIPPLE_WIDTH_MIN
+        # over just the first RIPPLE_FADE_FRAC of the travel distance (not the
+        # whole MAX_RADIUS), so each pulse reads as a small hard hit at the
+        # center that thins out quickly rather than staying thick for long.
+        fade_radius = MAX_RADIUS * RIPPLE_FADE_FRAC
+        frac  = _clamp(radius / fade_radius, 0.0, 1.0) if fade_radius > 0 else 1.0
+        width = RIPPLE_WIDTH + (RIPPLE_WIDTH_MIN - RIPPLE_WIDTH) * frac
         cx, cy = r["x"], r["y"]
         draw.ellipse(
-            [cx - radius - RIPPLE_WIDTH / 2, cy - radius - RIPPLE_WIDTH / 2,
-             cx + radius + RIPPLE_WIDTH / 2, cy + radius + RIPPLE_WIDTH / 2],
-            outline=0, width=max(1, round(RIPPLE_WIDTH)),
+            [cx - radius - width / 2, cy - radius - width / 2,
+             cx + radius + width / 2, cy + radius + width / 2],
+            outline=0, width=max(1, round(width)),
         )
     return canvas
 
