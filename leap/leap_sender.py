@@ -37,6 +37,8 @@ Env vars (all optional, CLI flags below take precedence):
   LEAP_PI_PORT    default 5566
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os

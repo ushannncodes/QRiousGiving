@@ -37,6 +37,8 @@ Env vars (all optional):
   FINGER_WIDTH        stroke width for fingers in display-units (default 1.6)
 """
 
+from __future__ import annotations
+
 import json
 import os
 import time
