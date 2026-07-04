@@ -314,6 +314,13 @@ class ProtocolV2(object):
         self.FRAME_BUFFER_SIZE = 1024
         self.receive_index = HEADER_0_INDEX
         self.receive_buffer = bytearray(1024)
+        # Max time wait() spends trying to receive one valid frame before
+        # giving up. A valid HuskyLens response arrives in tens of ms; the
+        # original 8000ms let a desynced read (consuming garbage bytes until
+        # it re-aligns) stall for ~1s, freezing the live pose feed. Capping it
+        # low turns a slow resync into a fast miss — the next poll issues a
+        # fresh request which re-syncs quicker. Tunable by callers if needed.
+        self.wait_timeout_ms = 300
         self.connect = False
         self.commandHeader = [0x55, 0xAA]
         self.customId = [None, None, None]
@@ -348,11 +355,29 @@ class ProtocolV2(object):
         ret, _, _ = self.executeCommand(wait_cmd=COMMAND_RETURN_ARGS)
         return ret
 
-    def getResult(self, algo):
+    def getResult(self, algo, retries=1):
+        # A detected pose is a large (~85B) frame; the I2C reader pulls 32B at a
+        # time, so a response rarely lands on a block boundary and leaves stray
+        # bytes queued. Those stale bytes desync the NEXT read (it parses garbage
+        # until it re-aligns or times out — the source of the ~1s feed freezes).
+        # Drop them before issuing this request: anything queued now is leftover,
+        # our response hasn't been written yet, so this is always safe.
+        try:
+            while not self.q.empty():
+                self.q.get_nowait()
+        except Exception:
+            pass
+
         self.husky_lens_protocol_write_begin(algo, COMMAND_GET_RESULT)
         self.husky_lens_protocol_write_end()
 
-        ret, _, _ = self.executeCommand(wait_cmd=COMMAND_RETURN_INFO)
+        # With the drain above, retrying doesn't recover misses (measured:
+        # detect-rate is identical at retries 1/2/3) — extra tries only stack
+        # into a ~1s tail. So default to a single try: a bad read fails in
+        # ~0.35s and the next poll (~20ms later) re-requests. This roughly
+        # doubles effective throughput (~5Hz vs ~3Hz) and caps the worst-case
+        # read at ~0.56s vs the original 3x8s.
+        ret, _, _ = self.executeCommand(wait_cmd=COMMAND_RETURN_INFO, retries=retries)
         if not ret:
             return None
         if self.receive_index != CONTENT_INDEX + 10:
@@ -398,7 +423,7 @@ class ProtocolV2(object):
         start_ms = time.time_ns() // 1_000_000
         while receiving:
             now_ms = time.time_ns() // 1_000_000
-            if now_ms - start_ms > 8000:
+            if now_ms - start_ms > self.wait_timeout_ms:
                 break
             c = self._read_from_huskyLens()
             if c is None:
@@ -810,13 +835,13 @@ class ProtocolV2(object):
         ret, _, _ = self.executeCommand(wait_cmd=COMMAND_RETURN_ARGS)
         return ret
 
-    def executeCommand(self, wait_cmd):
-        for _ in range(3):
+    def executeCommand(self, wait_cmd, retries=3):
+        for _ in range(retries):
             self._write_to_huskyLens()
             ret, retInt, retStr = self.wait(wait_cmd)
             if ret:
                 return ret, retInt, retStr
-        # 重试 3 次后仍未成功
+        # 重试 retries 次后仍未成功
         return False, [], []
 
 class HuskylensV2(ProtocolV2):

@@ -27,6 +27,8 @@ shows a QR code so they can donate.
 - `assets/` — static assets (palm outline mask, images).
 - `legacy/` — old/dead code kept for reference; not part of the live
   pipeline.
+- `simulator/` — virtual flipdot panel for testing without the physical
+  hardware (this branch only — see "Testing without hardware" below).
 
 ## Running
 
@@ -46,6 +48,28 @@ The flipdot animation API runs separately:
 ```
 python3 api/flipdot-api.py
 ```
+
+## Testing without hardware
+
+The flipdot panel and HuskyLens aren't always connected. `simulator/flipdot_simulator.py`
+opens a virtual serial port standing in for the real panel, decodes the same
+wire protocol, and renders the resulting 28x28 grid live in a browser:
+
+```
+python3 simulator/flipdot_simulator.py
+```
+
+It prints a port (and a stable symlink at `/tmp/flipdot_vserial`) — point
+any flipdot script at it instead of real hardware:
+
+```
+export FLIPDOT_SERIAL=/tmp/flipdot_vserial   # attract_v2.py, hi5_final.py, qr_works.py
+export SERIAL_PORT=/tmp/flipdot_vserial       # anim.py, rand_anim/*.py
+python3 kiosk/attract_v2.py
+```
+
+Then open the printed `http://127.0.0.1:5050` URL (or check your editor's
+auto-forwarded ports if working over SSH/remote).
 
 ## Key env vars
 

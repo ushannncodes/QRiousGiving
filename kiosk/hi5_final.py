@@ -156,8 +156,8 @@ BAUD_RATE   = int(os.getenv("FLIPDOT_BAUD", "57600"))
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-HOLD_REQUIRED_SEC = float(os.getenv("HOLD_REQUIRED_SEC", "2.0"))
-MISS_GRACE_SEC    = float(os.getenv("MISS_GRACE_SEC", "0")) #tighten this
+HOLD_REQUIRED_SEC = float(os.getenv("HOLD_REQUIRED_SEC", "1.5"))
+MISS_GRACE_SEC    = float(os.getenv("MISS_GRACE_SEC", "1.5"))
 NEXT_SCRIPT       = os.getenv("NEXT_SCRIPT", os.path.join(SCRIPT_DIR, "qr_works.py"))
 
 MESSAGES = ["HI","I AM A FUTURE DONATION MACHINE","TO LEARN MORE","HI-5"]
@@ -507,7 +507,8 @@ def main():
         time.sleep(1)
     else:
         fatal("ERROR: could not connect to HuskyLens.")
-    hl.write_algo(ALGORITHM_HAND_RECOGNITION)  # write_algo() settles for us
+    if not hl.write_algo(ALGORITHM_HAND_RECOGNITION):
+        fatal("ERROR: HuskyLens never confirmed switching to hand recognition.")
 
     hold_start = None
     satisfied = False

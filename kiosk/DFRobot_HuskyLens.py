@@ -8,9 +8,12 @@ getCachedResultByIndex()), so this module is a thin translation layer rather
 than a copy of vendor code.
 """
 
+import logging
 import os
 import sys
 import time
+
+log = logging.getLogger(__name__)
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 
@@ -256,14 +259,43 @@ class _HuskyLensAdapter:
     def begin(self):
         return self._hl.begin()
 
-    def write_algo(self, algo):
+    def write_algo(self, algo, retries=4, settle=18.0, poll=0.3):
+        # switchAlgorithm()'s ack only means the command frame was received,
+        # not that the new model finished loading. After a switch the sensor
+        # drops off the bus and reloads the model, during which getResult()
+        # returns None; once the model is live it answers result queries again
+        # (measured on this unit: ~11-15s after a single switch, then steady).
+        #
+        # An earlier version brute-forced switchAlgorithm() every 3.5s for
+        # ~49s, but each re-issue RESTARTS the model reload — so hammering
+        # keeps pose perpetually in its unstable window and it only settles
+        # ~15s after the *last* switch (making warm-up ~60s+). Instead: switch
+        # once, then poll getResult() until the sensor starts answering (model
+        # live) and return immediately. Only re-issue the switch if it stays
+        # completely silent for the whole `settle` window, which means the
+        # switch didn't take (or the sensor dropped off entirely).
         self._algo = algo
-        ok = self._hl.switchAlgorithm(algo)
-        # The sensor briefly drops off the bus while it switches models
-        # (observed: disappears from i2cdetect for a couple seconds) —
-        # give it time to settle before the next request.
-        time.sleep(2.0)
-        return ok
+        for attempt in range(retries):
+            try:
+                self._hl.switchAlgorithm(algo)
+            except Exception as e:
+                log.warning("switchAlgorithm attempt %d/%d raised: %s", attempt + 1, retries, e)
+
+            deadline = time.time() + settle
+            while time.time() < deadline:
+                try:
+                    if self._hl.getResult(algo) is not None:
+                        log.info("HuskyLens: %s live after switch attempt %d/%d",
+                                 "pose" if algo == ALGORITHM_POSE_RECOGNITION else algo,
+                                 attempt + 1, retries)
+                        return True
+                except Exception:
+                    pass
+                time.sleep(poll)
+
+            log.warning("HuskyLens: no result frames %.0fs after switch attempt %d/%d; re-issuing",
+                        settle, attempt + 1, retries)
+        return False
 
     def request(self):
         return self._hl.getResult(self._algo) is not None
