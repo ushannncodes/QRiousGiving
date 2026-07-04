@@ -1,0 +1,4 @@
+# Dependencies for leap_sender.py, which runs on the PC/Mac that has the
+# Leap Motion attached and its tracking service installed — NOT on the Pi.
+# Install with: pip install -r leap/requirements-sender.txt
+websocket-client
