@@ -12,10 +12,16 @@ Grid values are plain 1 (lit) / 0 (unlit) — hardware wire polarity
 (WHITE_VAL) is a leap_flipdot_preview.py concern applied at serial-pack
 time, not a rendering concern.
 
+The hand is drawn as a filled silhouette, not a skeleton: the palm is a
+scan-line-filled polygon (wrist + thumb base + the four knuckle MCPs),
+and each finger is a tapered capsule stroke (thick at the knuckle,
+narrow at the tip) stamped along its bone segments. Thickness comes
+entirely from the strokes/fill — there is no post-hoc dilation pass.
+
 Env vars (see leap_flipdot_preview.py's module docstring for full
 descriptions):
   REFRESH_HZ, STALE_SEC, EASE_FACTOR, LINE_THICKNESS,
-  X_RANGE_MM, Z_MIN_MM, Z_MAX_MM, RANGE_MARGIN_MM, GRID_ROTATE, MIRROR
+  X_RANGE_MM, Z_MIN_MM, Z_MAX_MM, GRID_ROTATE, MIRROR
 
 GRID_ROTATE rotates the final grid counter-clockwise by 0/90/180/270
 degrees, and MIRROR flips it horizontally (applied after rotation) —
@@ -36,10 +42,15 @@ import os
 
 GRID = 28
 
-REFRESH_HZ = float(os.getenv("REFRESH_HZ", "6"))
+REFRESH_HZ = float(os.getenv("REFRESH_HZ", "18"))
 STALE_SEC = float(os.getenv("STALE_SEC", "0.5"))
-EASE_FACTOR = max(0.0, min(1.0, float(os.getenv("EASE_FACTOR", "0.35"))))
-LINE_THICKNESS = int(os.getenv("LINE_THICKNESS", "1"))
+EASE_FACTOR = max(0.0, min(1.0, float(os.getenv("EASE_FACTOR", "0.65"))))
+LINE_THICKNESS = float(os.getenv("LINE_THICKNESS", "1.1"))
+# How fast the z window's center follows sustained changes in the hand's
+# real position, per redraw tick (see HandRenderer) — deliberately much
+# slower than EASE_FACTOR so one atypical frame (a hand mid-transition,
+# a hand-type swap) can't skew the whole session, only a sustained shift.
+Z_CENTER_EASE = max(0.0, min(1.0, float(os.getenv("Z_CENTER_EASE", "0.05"))))
 
 GRID_ROTATE = int(os.getenv("GRID_ROTATE", "0")) % 360
 if GRID_ROTATE not in (0, 90, 180, 270):
@@ -48,33 +59,65 @@ _ROTATE_STEPS = GRID_ROTATE // 90
 
 MIRROR = os.getenv("MIRROR", "0") not in ("0", "", "false", "False")
 
-X_RANGE_MM = float(os.getenv("X_RANGE_MM", "300"))
-Z_MIN_MM = float(os.getenv("Z_MIN_MM", "80"))
-Z_MAX_MM = float(os.getenv("Z_MAX_MM", "380"))
-RANGE_MARGIN_MM = float(os.getenv("RANGE_MARGIN_MM", "20"))
+# Fixed-*size* calibration bounds. A deliberate departure from an
+# auto-expanding range: expand-only bounds meant one wide gesture
+# permanently shrank the hand for the rest of the session.
+#
+# X measured live off the real Beelink feed (current vertical mount,
+# PROJECT_AXES=x,z): a single hand's per-frame spread was ~109mm median,
+# centered close to 0 across multiple live captures (people naturally
+# center themselves left-right in front of the panel). A single-hand-
+# sized window (once ~190mm) comfortably filled ~80% of the grid for
+# one hand, but clipped/hid one hand whenever both hands were up at
+# once — real two-hand testing showed a combined span of 131-314mm
+# (median 224mm) across both hands together, so X_RANGE_MM is sized for
+# that (both hands visible) rather than a single hand filling the grid
+# tightly; a lone hand will look smaller than the 75-85%-fill ideal as
+# a direct consequence — that trade was chosen deliberately on user
+# feedback once two-hand use came up. X uses a truly fixed, absolute
+# window (not re-centered on the hand).
+#
+# Z (this mount's second axis) is different: per-frame *spread* was a
+# consistent ~136mm median, but the *absolute* center drifted by well
+# over 100mm between separate live captures (session to session, not
+# frame to frame) — it isn't a stable depth-from-sensor value on this
+# mount, so a fixed absolute window clipped the hand depending on
+# exactly where someone happened to hold it. Z_MIN_MM/Z_MAX_MM are
+# therefore an *offset window* (fixed size, ~180mm) re-centered on the
+# hand's actual position each time it appears (see HandRenderer below)
+# rather than absolute mm — X keeps real absolute left-right tracking,
+# Z keeps a real absolute reading only within one continuous
+# appearance, recentering after each stale reset.
+X_RANGE_MM = float(os.getenv("X_RANGE_MM", "270"))
+Z_MIN_MM = float(os.getenv("Z_MIN_MM", "-110"))
+Z_MAX_MM = float(os.getenv("Z_MAX_MM", "110"))
 
-_FINGERS = [
-    [0, 1, 2, 3, 4],
-    [0, 5, 6, 7, 8],
-    [0, 9, 10, 11, 12],
-    [0, 13, 14, 15, 16],
-    [0, 17, 18, 19, 20],
+# Finger taper: base radius (in grid cells) at the knuckle, narrowing to
+# FINGER_TIP_RATIO * base at the fingertip. Thumb is drawn noticeably
+# thicker than the other four fingers, matching a real hand.
+FINGER_TIP_RATIO = 0.4
+THUMB_RADIUS_SCALE = 1.15
+_FINGER_BASE_R = LINE_THICKNESS
+_FINGER_TIP_R = LINE_THICKNESS * FINGER_TIP_RATIO
+_THUMB_BASE_R = LINE_THICKNESS * THUMB_RADIUS_SCALE
+_THUMB_TIP_R = _THUMB_BASE_R * FINGER_TIP_RATIO
+
+# 21-point wrist-first layout (see LEAP_HANDOFF.md): 0 wrist, 1-4 thumb
+# (CMC, MCP, IP, TIP), 5-8/9-12/13-16/17-20 index/middle/ring/pinky
+# (MCP, PIP, DIP, TIP).
+_PALM_POLY = (0, 1, 2, 5, 9, 13, 17)
+
+_FINGER_SPECS = [
+    ((1, 2, 3, 4), _THUMB_BASE_R, _THUMB_TIP_R),
+    ((5, 6, 7, 8), _FINGER_BASE_R, _FINGER_TIP_R),
+    ((9, 10, 11, 12), _FINGER_BASE_R, _FINGER_TIP_R),
+    ((13, 14, 15, 16), _FINGER_BASE_R, _FINGER_TIP_R),
+    ((17, 18, 19, 20), _FINGER_BASE_R, _FINGER_TIP_R),
 ]
 
 
-def _initial_bounds():
-    return (-X_RANGE_MM / 2, X_RANGE_MM / 2, Z_MIN_MM, Z_MAX_MM)
-
-
-def _expand_bounds(bounds, landmarks):
-    x_lo, x_hi, z_lo, z_hi = bounds
-    xs = [p[0] for p in landmarks]
-    zs = [p[1] for p in landmarks]
-    x_lo = min(x_lo, min(xs) - RANGE_MARGIN_MM)
-    x_hi = max(x_hi, max(xs) + RANGE_MARGIN_MM)
-    z_lo = min(z_lo, min(zs) - RANGE_MARGIN_MM)
-    z_hi = max(z_hi, max(zs) + RANGE_MARGIN_MM)
-    return (x_lo, x_hi, z_lo, z_hi)
+def _bounds_for(z_center):
+    return (-X_RANGE_MM / 2, X_RANGE_MM / 2, z_center + Z_MIN_MM, z_center + Z_MAX_MM)
 
 
 def _to_grid(x_mm, z_mm, bounds):
@@ -106,23 +149,53 @@ def _bresenham(x0, y0, x1, y1):
     return points
 
 
-def _dilate(frame, passes):
-    for _ in range(max(0, passes)):
-        src = frame
-        frame = [row[:] for row in src]
-        for y in range(GRID):
-            for x in range(GRID):
-                if not src[y][x]:
-                    continue
-                if x + 1 < GRID:
-                    frame[y][x + 1] = 1
-                if x - 1 >= 0:
-                    frame[y][x - 1] = 1
-                if y + 1 < GRID:
-                    frame[y + 1][x] = 1
-                if y - 1 >= 0:
-                    frame[y - 1][x] = 1
-    return frame
+def _stamp_disk(frame, cx, cy, r):
+    ri = int(r) + 1
+    r2 = r * r
+    for dy in range(-ri, ri + 1):
+        y = cy + dy
+        if not (0 <= y < GRID):
+            continue
+        row = frame[y]
+        for dx in range(-ri, ri + 1):
+            if dx * dx + dy * dy > r2:
+                continue
+            x = cx + dx
+            if 0 <= x < GRID:
+                row[x] = 1
+
+
+def _stamp_thick_line(frame, x0, y0, x1, y1, r0, r1):
+    """Bresenham centerline stamped with a disk at every point, radius
+    interpolated from r0 (start) to r1 (end) — a tapered capsule."""
+    pts = _bresenham(x0, y0, x1, y1)
+    n = len(pts)
+    for i, (px, py) in enumerate(pts):
+        t = i / (n - 1) if n > 1 else 0.0
+        _stamp_disk(frame, px, py, r0 + (r1 - r0) * t)
+
+
+def _fill_polygon(frame, points):
+    """Even-odd scan-line fill. points are (col, row) grid coords."""
+    ys = [p[1] for p in points]
+    y_lo, y_hi = max(0, min(ys)), min(GRID - 1, max(ys))
+    n = len(points)
+    for y in range(y_lo, y_hi + 1):
+        xs = []
+        for i in range(n):
+            x0, y0 = points[i]
+            x1, y1 = points[(i + 1) % n]
+            if y0 == y1:
+                continue
+            if (y0 <= y < y1) or (y1 <= y < y0):
+                t = (y - y0) / (y1 - y0)
+                xs.append(x0 + t * (x1 - x0))
+        xs.sort()
+        for i in range(0, len(xs) - 1, 2):
+            x_lo = max(0, int(round(xs[i])))
+            x_hi = min(GRID - 1, int(round(xs[i + 1])))
+            for x in range(x_lo, x_hi + 1):
+                frame[y][x] = 1
 
 
 def _rotate_ccw_90(frame):
@@ -142,17 +215,23 @@ def _apply_orientation(frame):
     return frame
 
 
-def _landmarks_to_frame(landmarks, bounds):
-    frame = [[0] * GRID for _ in range(GRID)]
+def _draw_hand(frame, landmarks, bounds):
     grid_pts = [_to_grid(x, z, bounds) for x, z in landmarks]
-    for finger in _FINGERS:
-        for a, b in zip(finger, finger[1:]):
-            (x0, y0), (x1, y1) = grid_pts[a], grid_pts[b]
-            for px, py in _bresenham(x0, y0, x1, y1):
-                frame[py][px] = 1
-    for px, py in grid_pts:
-        frame[py][px] = 1
-    frame = _dilate(frame, LINE_THICKNESS)
+    _fill_polygon(frame, [grid_pts[i] for i in _PALM_POLY])
+    for bone, base_r, tip_r in _FINGER_SPECS:
+        pts = [grid_pts[i] for i in bone]
+        segs = len(pts) - 1
+        for i in range(segs):
+            r0 = base_r + (tip_r - base_r) * (i / segs)
+            r1 = base_r + (tip_r - base_r) * ((i + 1) / segs)
+            (x0, y0), (x1, y1) = pts[i], pts[i + 1]
+            _stamp_thick_line(frame, x0, y0, x1, y1, r0, r1)
+
+
+def _landmarks_to_frame(hands_landmarks, bounds):
+    frame = [[0] * GRID for _ in range(GRID)]
+    for landmarks in hands_landmarks:
+        _draw_hand(frame, landmarks, bounds)
     return _apply_orientation(frame)
 
 
@@ -161,30 +240,65 @@ def blank_frame():
 
 
 class HandRenderer:
-    """Stateful per-stream renderer: applies motion easing and
-    auto-expanding calibration bounds across successive landmark
-    packets, mirroring exactly what the physical panel driver does."""
+    """Stateful per-stream renderer: applies motion easing across
+    successive landmark packets against fixed-*size* calibration bounds,
+    mirroring exactly what the physical panel driver does. Easing state
+    is kept per hand_type ("left"/"right") so up to two hands can be
+    tracked and eased independently in the same frame.
+
+    The z window tracks the hand's actual position with a slow-moving
+    center (see Z_MIN_MM/Z_MAX_MM above) — the z axis's absolute value
+    isn't stable session to session on this mount, only its span is.
+    A single frame isn't trusted to set the center on its own (a hand
+    caught mid-transition, or a hand-type swap, would skew the whole
+    session) — instead the center eases toward the observed average at
+    Z_CENTER_EASE per frame, much slower than EASE_FACTOR, so it settles
+    on a sustained position over roughly a second rather than snapping
+    to whatever landmark happened to arrive first."""
 
     def __init__(self):
-        self.bounds = _initial_bounds()
-        self.eased = None
+        self.z_center = None
+        self.eased = {}  # hand_type -> [[x, z], ...]
 
     def reset(self):
         """Call when the feed goes stale so reappearing hands don't ease
-        in from a stale old position."""
-        self.eased = None
+        in from a stale old position, and the z center starts fresh
+        (instantly, from the next frame) rather than easing in from a
+        stale old spot."""
+        self.eased = {}
+        self.z_center = None
 
-    def update(self, landmarks):
-        """landmarks: raw [[x, z], ...] or falsy. Returns a GRIDxGRID
-        frame of 1 (lit) / 0 (unlit)."""
-        if not landmarks:
+    def update(self, hands):
+        """hands: [{"hand_type": "left"/"right", "landmarks": [[x, z], ...]}, ...]
+        or falsy/empty. Returns a GRIDxGRID frame of 1 (lit) / 0 (unlit)."""
+        if not hands:
             self.reset()
             return blank_frame()
-        self.bounds = _expand_bounds(self.bounds, landmarks)
-        if self.eased is None or len(self.eased) != len(landmarks):
-            self.eased = [list(p) for p in landmarks]
+        all_z = [z for h in hands for _, z in h["landmarks"]]
+        observed_center = sum(all_z) / len(all_z)
+        if self.z_center is None:
+            self.z_center = observed_center
         else:
-            for i, (tx, tz) in enumerate(landmarks):
-                self.eased[i][0] += (tx - self.eased[i][0]) * EASE_FACTOR
-                self.eased[i][1] += (tz - self.eased[i][1]) * EASE_FACTOR
-        return _landmarks_to_frame(self.eased, self.bounds)
+            self.z_center += (observed_center - self.z_center) * Z_CENTER_EASE
+        bounds = _bounds_for(self.z_center)
+        eased_frames = []
+        seen = set()
+        for h in hands:
+            key, landmarks = h["hand_type"], h["landmarks"]
+            seen.add(key)
+            prev = self.eased.get(key)
+            if prev is None or len(prev) != len(landmarks):
+                eased = [list(p) for p in landmarks]
+            else:
+                eased = prev
+                for i, (tx, tz) in enumerate(landmarks):
+                    eased[i][0] += (tx - eased[i][0]) * EASE_FACTOR
+                    eased[i][1] += (tz - eased[i][1]) * EASE_FACTOR
+            self.eased[key] = eased
+            eased_frames.append(eased)
+        # Drop hands no longer present so a re-appearing one doesn't ease
+        # in from a stale old spot.
+        for key in list(self.eased):
+            if key not in seen:
+                del self.eased[key]
+        return _landmarks_to_frame(eased_frames, bounds)

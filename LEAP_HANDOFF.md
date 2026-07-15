@@ -200,18 +200,72 @@ gotcha" above) before judging whether it looks right.
 
 All via env vars, no code edits needed for quick experiments:
 
-- `leap_flipdot_preview.py` / `flipdot_render.py`: `REFRESH_HZ` (currently
-  6 — mechanical panel, throttled deliberately to avoid hammering the
-  dots), `EASE_FACTOR` (motion smoothing between redraws, default 0.35),
-  `LINE_THICKNESS` (stroke width via pixel dilation, default 1),
-  `X_RANGE_MM`/`Z_MIN_MM`/`Z_MAX_MM` (now just a starting floor — the
-  mapped range auto-expands as real coordinates arrive, so a bad initial
-  guess self-corrects within a few seconds instead of clipping the hand
-  into a narrow band), `GRID_ROTATE` (0/90/180/270, display rotation),
-  `MIRROR` (1 to horizontally flip, fixes handedness), `WHITE_VAL`.
+- `leap_flipdot_preview.py` / `flipdot_render.py`: `REFRESH_HZ` (default
+  18 now — raised from 6 once the serial link's real ceiling, ~45Hz at
+  57600 baud for 4 panels, was checked; still mechanical, so don't push
+  much past this without testing the physical panel), `EASE_FACTOR`
+  (motion smoothing between redraws, default 0.65, raised from 0.35 for
+  snappier tracking), `LINE_THICKNESS` (finger stroke *radius* in grid
+  cells now, not dilation passes — default 1.6, thumb drawn at 1.3x),
+  `X_RANGE_MM`/`Z_MIN_MM`/`Z_MAX_MM` (fixed bounds now, not
+  auto-expanding — tuned so a hand at normal hover distance fills
+  ~75-85% of the grid; see "Rendering rewrite" below), `GRID_ROTATE`
+  (0/90/180/270, display rotation), `MIRROR` (1 to horizontally flip,
+  fixes handedness), `WHITE_VAL`.
 - `beelink/leap_sender.py`: `SEND_HZ`, `PREFERRED_HAND`, `PROJECT_AXES`
   (which raw Leap axes become the 2D landmark pair — fixes hand *shape*,
   not display orientation; see "Where things stand on orientation").
+
+## Rendering rewrite — filled silhouette (this session)
+
+`flipdot_render.py` no longer draws a stick-figure skeleton — it draws a
+filled hand silhouette, closer to the BikoArtz flipdot hand-shadow
+reference than the old line-based version:
+
+- **Palm**: scan-line-filled polygon over `(wrist, thumb CMC, thumb MCP,
+  index/middle/ring/pinky MCPs)` — `_fill_polygon()` in
+  `flipdot_render.py`.
+- **Fingers**: each drawn as a tapered capsule (`_stamp_thick_line()` +
+  `_stamp_disk()`) — thick at the knuckle (`LINE_THICKNESS`, thumb at
+  1.3x), narrowing to `FINGER_TIP_RATIO` (0.45) of that at the tip. The
+  old generic `_dilate()` pixel-dilation pass is gone entirely —
+  thickness now comes only from the strokes and the palm fill.
+- **Bounds are fixed, not auto-expanding.** The old `_expand_bounds()`
+  only ever grew the mapped range, so one wide gesture permanently
+  shrank the displayed hand for the rest of the session. `X_RANGE_MM`
+  (200) / `Z_MIN_MM` (100) / `Z_MAX_MM` (320) are now a fixed mapping,
+  tuned against a synthetic hand model (see below) so a hand at normal
+  hover distance fills ~75-85% of the 28x28 grid. Panel *position* still
+  tracks the hand's real x/z, unaffected by this — only the scale is
+  now fixed instead of creeping.
+- `REFRESH_HZ` raised 6 → 18 (the 4-panel serial write is ~128
+  bytes/frame at 57600 baud, ceiling ~45Hz, so 18Hz leaves headroom) and
+  `EASE_FACTOR` raised 0.35 → 0.65 for snappier tracking.
+
+**Not yet verified on the real panel or with the real Beelink feed** —
+verified so far only against a throwaway synthetic-hand script (adult-hand
+proportions, not `synthetic_hand_test.py`, which writes a different/older
+JSON schema — see below) feeding `HandRenderer` directly and eyeballing
+the ASCII-rendered grid. Confirmed there: open spread hand reads as a
+solid palm with 5 separated tapering fingers filling ~78% of the grid in
+both axes; a hand curled to a real fist's degree of bend collapses to a
+compact blob. **Next session should confirm this holds with the actual
+Beelink feed** via `leap_visualizer.py` before trusting it on the
+physical panel, and re-tune `X_RANGE_MM`/`Z_MIN_MM`/`Z_MAX_MM` /
+`LINE_THICKNESS` against a real hand if the fill percentage or stroke
+weight looks off — the current numbers are a best estimate from hand
+proportions, not a real-hardware measurement.
+
+**`synthetic_hand_test.py` note:** this file (and `leap/leap_sender.py`,
+`leap/attract_leap_shadow.py` in this same folder) are leftover from an
+earlier prototype stage — they use a different JSON-over-file schema
+(`/tmp/leap_state.json`, `{"palm": ..., "fingers": {"thumb": {"joints":
+...}}}`) than the current UDP/`flipdot_render.py` schema
+(`{"hand_type", "landmarks": [[x, z], ...]}`, 21 flat points). They
+predate the `beelink/leap_sender.py` rewrite and aren't wired to
+`leap_flipdot_preview.py`/`leap_visualizer.py` at all. Don't assume
+`synthetic_hand_test.py` exercises the current pipeline without checking
+the schema match first — it currently doesn't.
 
 ## Not yet done / open ends
 
@@ -224,16 +278,13 @@ All via env vars, no code edits needed for quick experiments:
   right but left/right-swapped (fix `MIRROR`). Don't skip straight to
   guessing `PROJECT_AXES` sign flips for what's actually a rotation/mirror
   problem, or vice versa — they fix different, non-overlapping things.
-- Calibration bounds now auto-expand from the `X_RANGE_MM`/`Z_MIN_MM`/
-  `Z_MAX_MM` starting floor as real coordinates arrive (see
-  `leap_flipdot_preview.py`'s `expand_bounds`), so it should stop
-  clustering near one edge — still worth confirming against the real
-  mount that the converged range feels right once it's had a few seconds
-  of hand movement to widen out.
-- Motion easing (`EASE_FACTOR`) and thicker finger strokes
-  (`LINE_THICKNESS`, via pixel dilation) are done. Still no fill or
-  reaction to open/closed palm state — that's the remaining "make it more
-  fun" surface area for the next session.
+- Calibration bounds are now fixed (not auto-expanding) and the hand is
+  a filled silhouette, not a skeleton — see "Rendering rewrite" above.
+  Still needs real-hardware confirmation of fill % and stroke weight.
+- Motion easing (`EASE_FACTOR`) and a filled, reactive-looking hand
+  shape are done. Still no reaction to open/closed palm state (e.g. a
+  distinct look on hi-5/spread vs. fist beyond the shape itself) — that's
+  the remaining "make it more fun" surface area for the next session.
 - `leap_receiver.py`'s `/tmp/leap_state.json` output (schema close to
   `cam_v2.py`'s `/tmp/cam_state.json`) hasn't been consumed by anything
   yet — it's there for whenever this gets wired into the real kiosk flow,

@@ -48,9 +48,9 @@ Setup (once, on the Beelink):
        RPI_PORT        UDP port on the Pi (default 5111)
        SEND_HZ         max send rate, throttled from Leap's own ~90-120Hz
                         frame rate (default 30)
-       PREFERRED_HAND  "right", "left", or "any" (default "any" â sends
-                        whichever hand is tracked; if both are visible,
-                        sends the most recently updated one)
+       PREFERRED_HAND  "right", "left", or "any" (default "any" — sends
+                        every currently tracked hand, up to 2; set to
+                        "left"/"right" to only ever send that one hand)
        PROJECT_AXES    which two Leap axes become each landmark's [a, b],
                         comma-separated, each optionally "-"-prefixed to
                         flip its sign (default "x,z" â the original
@@ -138,18 +138,21 @@ class SenderListener(leap.Listener):
         if not hands:
             return
 
-        chosen = hands[0]
-        if PREFERRED_HAND in ("left", "right") and len(hands) > 1:
+        if PREFERRED_HAND in ("left", "right"):
             wanted = "HandType.Left" if PREFERRED_HAND == "left" else "HandType.Right"
-            for h in hands:
-                if str(h.type) == wanted:
-                    chosen = h
-                    break
+            hands = [h for h in hands if str(h.type) == wanted]
+            if not hands:
+                return
 
         payload = {
             "ts": now,
-            "hand_type": "left" if str(chosen.type) == "HandType.Left" else "right",
-            "landmarks": hand_to_landmarks(chosen),
+            "hands": [
+                {
+                    "hand_type": "left" if str(h.type) == "HandType.Left" else "right",
+                    "landmarks": hand_to_landmarks(h),
+                }
+                for h in hands
+            ],
         }
         msg = json.dumps(payload).encode("utf-8")
         sock.sendto(msg, (RPI_HOST, RPI_PORT))

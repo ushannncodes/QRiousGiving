@@ -32,7 +32,7 @@ Env vars:
                 handedness, only a flip changes it)
 
 The flipdot-preview pane redraws at REFRESH_HZ (see flipdot_render.py,
-default 6), same as the real panel, not at the raw ~30Hz packet rate —
+default 18), same as the real panel, not at the raw ~30Hz packet rate —
 otherwise the motion easing would look smoother here than it actually
 does on the mechanical panel.
 
@@ -59,7 +59,7 @@ ANGLE_DIP_THRESH_DEG = 118.0
 DIST_MARGIN = 3.0
 
 _lock = threading.Lock()
-_latest = {"ts": 0.0, "hand_type": None, "landmarks": None}
+_latest = {"ts": 0.0, "hands": None}
 _flipdot_lock = threading.Lock()
 _flipdot_latest = {"ts": 0.0, "frame": None}
 
@@ -105,8 +105,7 @@ def udp_listener():
             continue
         with _lock:
             _latest["ts"] = time.time()
-            _latest["hand_type"] = payload.get("hand_type")
-            _latest["landmarks"] = payload.get("landmarks")
+            _latest["hands"] = payload.get("hands")
 
 
 def flipdot_loop():
@@ -117,11 +116,11 @@ def flipdot_loop():
     min_interval = 1.0 / REFRESH_HZ
     while True:
         with _lock:
-            landmarks = _latest["landmarks"]
+            hands = _latest["hands"]
             last_ts = _latest["ts"]
         stale = (time.time() - last_ts) > STALE_SEC if last_ts else True
-        frame = None if (stale or not landmarks) else renderer.update(landmarks)
-        if stale or not landmarks:
+        frame = None if (stale or not hands) else renderer.update(hands)
+        if stale or not hands:
             renderer.reset()
         with _flipdot_lock:
             _flipdot_latest["ts"] = time.time()
@@ -140,6 +139,7 @@ PAGE = """<!DOCTYPE html>
   h2 { font-size:14px; font-weight:normal; color:#999; margin:0 0 8px; }
   .panes { display:flex; flex-wrap:wrap; justify-content:center; gap:24px; }
   .pane canvas { background:#000; border:1px solid #444; }
+  #flipdot { background:#eee; border:1px solid #999; }
   .open { color:#7CFC00; }
   .closed { color:#FF6347; }
   .none { color:#888; }
@@ -186,10 +186,13 @@ function drawRaw(data) {
   const canvas = document.getElementById('raw');
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  if (!data.landmarks) return;
+  if (!data.hands || !data.hands.length) return;
 
-  const lm = data.landmarks;
-  const xs = lm.map(p => p[0]), ys = lm.map(p => p[1]);
+  // Fit all hands into one shared bounding box so two hands stay
+  // positioned relative to each other, instead of each auto-centering
+  // on its own and hiding their real relative position/scale.
+  const allPts = data.hands.flatMap(h => h.landmarks);
+  const xs = allPts.map(p => p[0]), ys = allPts.map(p => p[1]);
   const minX = Math.min(...xs), maxX = Math.max(...xs);
   const minY = Math.min(...ys), maxY = Math.max(...ys);
   const pad = 40;
@@ -207,23 +210,26 @@ function drawRaw(data) {
     return [px, py];
   };
 
-  ctx.strokeStyle = data.open_palm ? '#7CFC00' : '#FF6347';
-  ctx.lineWidth = 3;
-  for (const finger of FINGERS) {
-    ctx.beginPath();
-    finger.forEach((idx, i) => {
-      const [px, py] = proj(lm[idx]);
-      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  for (const hand of data.hands) {
+    const lm = hand.landmarks;
+    ctx.strokeStyle = hand.open_palm ? '#7CFC00' : '#FF6347';
+    ctx.lineWidth = 3;
+    for (const finger of FINGERS) {
+      ctx.beginPath();
+      finger.forEach((idx, i) => {
+        const [px, py] = proj(lm[idx]);
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      });
+      ctx.stroke();
+    }
+    ctx.fillStyle = '#fff';
+    lm.forEach(p => {
+      const [px, py] = proj(p);
+      ctx.beginPath();
+      ctx.arc(px, py, 4, 0, Math.PI*2);
+      ctx.fill();
     });
-    ctx.stroke();
   }
-  ctx.fillStyle = '#fff';
-  lm.forEach(p => {
-    const [px, py] = proj(p);
-    ctx.beginPath();
-    ctx.arc(px, py, 4, 0, Math.PI*2);
-    ctx.fill();
-  });
 }
 
 function drawFlipdot(frame) {
@@ -237,7 +243,9 @@ function drawFlipdot(frame) {
       const lit = frame && frame[row] && frame[row][col];
       ctx.beginPath();
       ctx.arc(col*cell + cell/2, row*cell + cell/2, r, 0, Math.PI*2);
-      ctx.fillStyle = lit ? '#fff' : '#2a2a2a';
+      // Matches WHITE_VAL=0 on the real panel: hand = dark dots (a
+      // shadow), background = light dots — not white-on-black.
+      ctx.fillStyle = lit ? '#222' : '#ccc';
       ctx.fill();
     }
   }
@@ -249,13 +257,14 @@ async function tick() {
     const data = await res.json();
     const statusEl = document.getElementById('status');
 
-    if (!data.landmarks) {
+    if (!data.hands || !data.hands.length) {
       statusEl.textContent = 'no hand detected';
       statusEl.className = 'none';
     } else {
       const ageMs = (Date.now()/1000 - data.ts) * 1000;
-      statusEl.textContent = `${data.hand_type} hand — ${data.open_palm ? 'OPEN' : 'closed'} — latency ${ageMs.toFixed(0)}ms`;
-      statusEl.className = data.open_palm ? 'open' : 'closed';
+      const parts = data.hands.map(h => `${h.hand_type} ${h.open_palm ? 'OPEN' : 'closed'}`);
+      statusEl.textContent = `${parts.join(' · ')} — latency ${ageMs.toFixed(0)}ms`;
+      statusEl.className = data.hands.some(h => h.open_palm) ? 'open' : 'closed';
     }
     drawRaw(data);
     drawFlipdot(data.flipdot_frame);
@@ -280,20 +289,24 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/latest":
             with _lock:
                 ts = _latest["ts"]
-                hand_type = _latest["hand_type"]
-                landmarks = _latest["landmarks"]
+                hands = _latest["hands"]
             stale = (time.time() - ts) > STALE_SEC if ts else True
             with _flipdot_lock:
                 flipdot_frame = _flipdot_latest["frame"]
-            if stale or not landmarks:
-                body = json.dumps({"ts": ts, "hand_type": None, "landmarks": None, "flipdot_frame": None})
+            if stale or not hands:
+                body = json.dumps({"ts": ts, "hands": None, "flipdot_frame": None})
             else:
-                open_palm = is_open_palm(landmarks)
+                hands_out = [
+                    {
+                        "hand_type": h["hand_type"],
+                        "landmarks": h["landmarks"],
+                        "open_palm": is_open_palm(h["landmarks"]),
+                    }
+                    for h in hands
+                ]
                 body = json.dumps({
                     "ts": ts,
-                    "hand_type": hand_type,
-                    "landmarks": landmarks,
-                    "open_palm": open_palm,
+                    "hands": hands_out,
                     "flipdot_frame": flipdot_frame,
                 })
             self.send_response(200)
