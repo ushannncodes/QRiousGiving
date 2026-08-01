@@ -12,14 +12,14 @@ a standalone side-track, separate from the HuskyLens-based kiosk pipeline.
 
 **Currently running on the Pi** (background, via the relay setup below):
 `leap_udp_relay.py`, `leap_flipdot_preview.py` (`LISTEN_PORT=5112,
-GRID_ROTATE=90, MIRROR=1`), and `leap_visualizer.py` (`LISTEN_PORT=5113,
-HTTP_PORT=8090, GRID_ROTATE=90, MIRROR=1`) — started to debug why the
+GRID_ROTATE=180, MIRROR=1`), and `leap_visualizer.py` (`LISTEN_PORT=5113,
+HTTP_PORT=8090, GRID_ROTATE=180, MIRROR=1`) — started to debug why the
 panel was showing round blobs instead of a hand shape, then wrong
 orientation, then a mirrored thumb, by comparing the raw capture against
-the flipdot simulation live. **Status: shape and rough orientation are
-working (see "Where things stand" below), but expect to keep refining
-this** — it's not a settled, done thing yet. Kill and restart per the
-cheat sheet below if a fresh session needs to pick this back up.
+the flipdot simulation live. **Status: orientation confirmed correct
+on real hardware with `GRID_ROTATE=180, MIRROR=1`** (see "Where things
+stand" below). Kill and restart per the cheat sheet below if a fresh
+session needs to pick this back up.
 
 **Browser-cache gotcha:** the flipdot pane is computed fresh server-side
 on every request, but the raw-capture pane's rotate/mirror logic is JS
@@ -29,19 +29,20 @@ does NOT push new JS to a browser tab that's already open. Hard-refresh
 or the two panes can look inconsistent for a reason that has nothing to
 do with the actual code.
 
-**Where things stand on orientation (as of this session):**
+**Where things stand on orientation (confirmed 2026-08-01):**
 - `PROJECT_AXES=x,z` (on the Beelink) gives a correctly *shaped* hand —
   fingers spread out and distinguishable, not a collapsed blob. This was
   discovered by comparing `x,y` (which gave an edge-on/profile-collapsed
   fan — one axis carried no spread info for a palm facing the sensor)
   against `x,z` in `leap_visualizer.py`'s raw pane.
-- `GRID_ROTATE=90` (on the Pi, in `flipdot_render.py`) fixes the display
-  being rotated 90° from the physical mount.
+- `GRID_ROTATE=180` (on the Pi, in `flipdot_render.py`) fixes the display
+  being upside down from the physical mount — `90` was tried first and
+  left the hand upside down, `180` is the value that's actually correct.
 - `MIRROR=1` (on the Pi, same module) fixes a left/right-swapped
   hand (thumb on the wrong side) — rotation alone can never fix this,
   since rotation preserves handedness and only a flip changes it.
-- This combination hasn't been extensively field-tested yet — treat it
-  as the current best guess, not a final calibration.
+- **Confirmed correct on real hardware** with `GRID_ROTATE=180,
+  MIRROR=1` — no longer just a best guess.
 
 ## Why this exists / architecture
 
@@ -186,8 +187,8 @@ local ports, so both consumers can run continuously side by side:
 ```bash
 cd ~/QRiousGiving/leap
 python3 leap_udp_relay.py                                                        # :5111 -> :5112, :5113
-LISTEN_PORT=5112 GRID_ROTATE=90 MIRROR=1 python3 leap_flipdot_preview.py          # panel
-LISTEN_PORT=5113 HTTP_PORT=8090 GRID_ROTATE=90 MIRROR=1 python3 leap_visualizer.py  # http://<pi-ip>:8090
+LISTEN_PORT=5112 GRID_ROTATE=180 MIRROR=1 python3 leap_flipdot_preview.py          # panel
+LISTEN_PORT=5113 HTTP_PORT=8090 GRID_ROTATE=180 MIRROR=1 python3 leap_visualizer.py  # http://<pi-ip>:8090
 ```
 Start the relay first, then the two consumers, then `leap_sender.py` on
 the Beelink last. `GRID_ROTATE`/`MIRROR` must match between the two
@@ -269,15 +270,15 @@ the schema match first — it currently doesn't.
 
 ## Not yet done / open ends
 
-- **Orientation (`PROJECT_AXES=x,z` + `GRID_ROTATE=90` + `MIRROR=1`) needs
-  more real-world refinement** — this combination fixed shape, rotation,
-  and handedness in this session's testing, but hasn't been extensively
-  validated yet. If it looks off again, work through it in this order:
-  is the raw pane's *shape* wrong (fix `PROJECT_AXES`) → is the raw pane
-  shaped right but rotated wrong (fix `GRID_ROTATE`) → is it rotated
-  right but left/right-swapped (fix `MIRROR`). Don't skip straight to
-  guessing `PROJECT_AXES` sign flips for what's actually a rotation/mirror
-  problem, or vice versa — they fix different, non-overlapping things.
+- **Orientation is now confirmed**: `PROJECT_AXES=x,z` + `GRID_ROTATE=180`
+  + `MIRROR=1` fixes shape, rotation, and handedness, verified on real
+  hardware 2026-08-01. If it ever looks off again (e.g. after a remount),
+  work through it in this order: is the raw pane's *shape* wrong (fix
+  `PROJECT_AXES`) → is the raw pane shaped right but rotated wrong (fix
+  `GRID_ROTATE`) → is it rotated right but left/right-swapped (fix
+  `MIRROR`). Don't skip straight to guessing `PROJECT_AXES` sign flips for
+  what's actually a rotation/mirror problem, or vice versa — they fix
+  different, non-overlapping things.
 - Calibration bounds are now fixed (not auto-expanding) and the hand is
   a filled silhouette, not a skeleton — see "Rendering rewrite" above.
   Still needs real-hardware confirmation of fill % and stroke weight.
