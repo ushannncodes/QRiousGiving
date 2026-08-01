@@ -7,12 +7,18 @@ import os
 # SERIAL_PORT = "/dev/ttyS0"
 # BAUD_RATE = 57600
 # PANEL_ADDRESSES = [1, 2, 3, 4]  # From top to bottom
-# QR_TEXT = "bit.ly/qriousgiving"  # ← Replace with your text or link
+# QR_TEXT = "qrgiving.framer.ai"  # ← Replace with your text or link
 
 SERIAL_PORT = os.getenv("FLIPDOT_SERIAL", "/dev/ttyS0")
 BAUD_RATE = int(os.getenv("FLIPDOT_BAUD", "57600"))
 PANEL_ADDRESSES = [1, 2, 3, 4]
-QR_TEXT = os.getenv("QR_TEXT", "bit.ly/qriousgiving")
+# Kept scheme-less on purpose: the 28x28 panel only has room for a 25x25
+# (version 2) QR at ERROR_CORRECT_Q, and "https://" pushes it to version 3
+# (29x29), which generate_qr_image()'s hard-coded 25x25 copy loop would
+# silently crop into an unscannable code. Phone cameras resolve a bare
+# domain fine. If a scheme is ever genuinely needed, drop to
+# ERROR_CORRECT_L, which fits it back into version 2.
+QR_TEXT = os.getenv("QR_TEXT", "qrgiving.framer.ai")
 
 
 
