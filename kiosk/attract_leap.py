@@ -36,17 +36,19 @@ Env vars:
   CAM_SIGNAL_PATH presence/landmark state file (default /tmp/cam_state.json,
                   same path cam_v2.py used — run_kiosk.py's _read_cam_state()
                   needs no changes)
-  WHITE_VAL       polarity, "1" or "0" (default 1, matching the rest of the
-                  kiosk pipeline's convention — NOT leap_flipdot_preview.py's
-                  inverted default of 0, since that inversion was a
-                  standalone-demo choice for a hand-shadow *effect*, and
-                  this script is now part of the same pipeline as
-                  attract_v2.py/hi5_final.py, which both assume WHITE_VAL=1)
+  WHITE_VAL       polarity, "1" or "0" (default 0 — dark hand-shadow on a
+                  light panel, matching leap_flipdot_preview.py's tuned
+                  look, NOT attract_v2.py/hi5_final.py's WHITE_VAL=1
+                  convention; override to 1 if this stage should go back
+                  to matching those instead)
 
 Rendering/staleness tuning (REFRESH_HZ, STALE_SEC, EASE_FACTOR,
-LINE_THICKNESS, GRID_ROTATE, MIRROR, X_RANGE_MM, Z_MIN_MM, Z_MAX_MM,
-Z_CENTER_EASE) all come from leap/flipdot_render.py — see that module's
-docstring, or leap/leap_flipdot_preview.py's, for full descriptions.
+LINE_THICKNESS, X_RANGE_MM, Z_MIN_MM, Z_MAX_MM, Z_CENTER_EASE) all come
+from leap/flipdot_render.py — see that module's docstring, or
+leap/leap_flipdot_preview.py's, for full descriptions. GRID_ROTATE
+(default 180) and MIRROR (default 1) are defaulted here specifically to
+the hardware-verified values from LEAP_HANDOFF.md, since flipdot_render.py
+itself defaults both to 0 for its other callers.
 """
 
 import json
@@ -58,6 +60,9 @@ import time
 
 import serial
 
+os.environ.setdefault("GRID_ROTATE", "180")
+os.environ.setdefault("MIRROR", "1")
+
 # flipdot_render.py lives in the sibling leap/ directory, not kiosk/ — add
 # it to the path rather than duplicating ~300 lines of rendering logic.
 _LEAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "leap")
@@ -68,7 +73,7 @@ LISTEN_PORT = int(os.getenv("LISTEN_PORT", "5111"))
 FLIPDOT_SERIAL = os.getenv("FLIPDOT_SERIAL", "/dev/ttyS0")
 FLIPDOT_BAUD = int(os.getenv("FLIPDOT_BAUD", "57600"))
 CAM_SIGNAL_PATH = os.getenv("CAM_SIGNAL_PATH", "/tmp/cam_state.json")
-WHITE_VAL = int(os.getenv("WHITE_VAL", "1"))
+WHITE_VAL = int(os.getenv("WHITE_VAL", "0"))
 BLACK_VAL = 1 - WHITE_VAL
 MIN_INTERVAL = 1.0 / REFRESH_HZ
 
