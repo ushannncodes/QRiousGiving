@@ -14,7 +14,9 @@ reusing `flipdot_render.py`'s `HandRenderer`) for the attract stage, and
 instead of the HuskyLens. HuskyLens is no longer the kiosk's default sensor
 for either stage — the old `cam_v2.py`/`attract_v2.py`/`attract_outline.py`
 scripts are still in the repo but unused by default, kept as reference. See
-"Wired into the kiosk" below for what changed and what's still untested.
+"Wired into the kiosk" below for what changed and what's still untested,
+and "Hi-5 detection rebuilt on Leap pose signals" for the gesture gate,
+which is confirmed working against a real hand on real hardware.
 The rest of this document (below) describes the standalone `leap/` demo
 scripts this integration is built on top of — `leap_flipdot_preview.py`,
 `leap_visualizer.py`, etc. are unchanged and still useful for isolating
@@ -393,26 +395,34 @@ section above). `kiosk/hi5_palm_debug.py` is the tuning harness — same
 detection code, no intro text, loops back on success instead of chaining
 to the QR script.
 
-**Verified 2026-08-01**, both stages and the full FSM, driven by
-`leap/synthetic_leap_udp_sender.py` (now sends `pose` blocks, plus a new
+**Confirmed on real hardware 2026-08-01** — a real high-five against the
+real Leap + flipdot panel, with the updated `leap_sender.py` running on the
+Beelink, triggers the fill and chains through to the QR. **The shipped
+defaults were what ran**: `MAX_GRAB_STRENGTH=0.20`,
+`MIN_EXTENDED_FINGERS=4`, `MAX_PINCH_STRENGTH=0.40`, `MISS_GRACE_SEC=0.35`,
+`HOLD_REQUIRED_SEC=1.5`, `PALM_FACING_AXIS` unset — no env overrides, no
+local edits. So 0.20 is a *confirmed working* threshold, not a guess.
+(Commit 31226d1's message predates this and still says "not yet confirmed";
+this section supersedes it.)
+
+Before that, the same behaviour was verified against
+`leap/synthetic_leap_udp_sender.py` (which now sends `pose` blocks, plus a
 `SYNTH_MODE=cycle` that alternates absence/open-palm to drive the whole
-kiosk unattended). Panel output went to a pty, so this is *not* yet
-confirmed against the real flipdot panel or a real hand:
+kiosk unattended), with panel output to a pty. Those cases are the ones
+awkward to stage by hand, and are worth rerunning after any change here:
 
-| Case | Result |
-|---|---|
-| Open palm held past the hold | fills, chains to `qr_works.py` |
-| Palm held 0.7s of 1.5s then withdrawn | stops at ~38%, no trigger |
-| Closed fist held 2.4s | 0%, never triggers |
-| Hands with no `pose` block | logs ABORT, exits cleanly to the kiosk |
-| Full FSM: attract → trigger → hi-5 → QR | all milestones hit |
+| Case | Result | How |
+|---|---|---|
+| Open palm held past the hold | fills, chains to `qr_works.py` | real hand + synthetic |
+| Palm held 0.7s of 1.5s then withdrawn | stops at ~38%, no trigger | synthetic |
+| Closed fist held 2.4s | 0%, never triggers | synthetic |
+| Hands with no `pose` block | logs ABORT, exits cleanly to the kiosk | synthetic |
+| Full FSM: attract → trigger → hi-5 → QR | all milestones hit | real hand + synthetic |
 
-Still to do: **tune `MAX_GRAB_STRENGTH` (0.20) against a real hand** — the
-synthetic feed reports a perfect 0.0, which proves the plumbing but tells
-you nothing about where a real relaxed-but-open hand sits. Optionally set
-`PALM_FACING_AXIS` afterwards to require a palm actually facing the panel
-rather than held edge-on; it's mount-dependent, so read it off
-`hi5_palm_debug.py`'s logged `palm_n=` values.
+Optional next tightening, only if false triggers show up in real use: set
+`PALM_FACING_AXIS` to require a palm actually facing the panel rather than
+held edge-on. It's mount-dependent, so read the axis off
+`hi5_palm_debug.py`'s logged `palm_n=` values rather than deriving it.
 
 ## Not yet done / open ends
 
@@ -432,10 +442,15 @@ rather than held edge-on; it's mount-dependent, so read it off
   shape are done. Still no reaction to open/closed palm state (e.g. a
   distinct look on hi-5/spread vs. fist beyond the shape itself) — that's
   the remaining "make it more fun" surface area for the next session.
+  This got much cheaper to build: `pose.grab` is now on the wire for every
+  hand (0.0 open → 1.0 fist), so `attract_leap.py` can drive a look off it
+  directly without any shape analysis. It currently ignores `pose`.
 - `leap_receiver.py`'s `/tmp/leap_state.json` output is a separate,
   still-unused debug artifact — `attract_leap.py`/`hi5_final.py` read the
   UDP feed directly, not this file.
 - No systemd service / autostart — everything's being run manually in a
   terminal for now, on both the Pi and the Beelink.
-- See "Wired into the kiosk" above for the current integration's open ends
-  (retuning, real-hardware verification).
+- See "Wired into the kiosk" above for the current integration's open ends.
+  The hi-5 gesture gate is no longer among them — it's confirmed on real
+  hardware at its shipped defaults; see "Hi-5 detection rebuilt on Leap
+  pose signals".
