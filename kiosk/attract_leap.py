@@ -23,7 +23,21 @@ drifting reimplementation.
 "Active" (for /tmp/cam_state.json) is defined the same way "not stale" is
 for rendering: a hand was present in the most recently received packet,
 and that packet arrived within STALE_SEC. There's no separate presence
-concept — if the panel isn't blank, run_kiosk.py should see active=True.
+concept — if the panel is showing a hand, run_kiosk.py sees active=True.
+
+Idle state: rather than blanking the panel when no hand is present, this
+now draws kiosk/hourglass.py's slowly draining hourglass — the kiosk's
+resting animation, and what the panel shows the vast majority of the time.
+The moment a hand appears the panel cuts to the live shadow, and each
+return to idle restarts the glass full rather than resuming mid-drain.
+The animation shares this process (rather than being a stage run_kiosk.py
+switches to) because only one process can bind the Leap UDP port, so
+whatever draws the idle art must also be the thing watching for hands.
+
+Frames are only written to the panel when they differ from the last one
+sent — the idle animation changes roughly every half second, far slower
+than REFRESH_HZ, and there's no reason to re-send a frame the panel is
+already displaying.
 
 Env vars:
   LISTEN_PORT     UDP port the Leap data arrives on (default 5111, must
@@ -41,6 +55,9 @@ Env vars:
                   look, NOT attract_v2.py/hi5_final.py's WHITE_VAL=1
                   convention; override to 1 if this stage should go back
                   to matching those instead)
+
+  HOURGLASS_*     idle-animation knobs (cycle length, flip beat, vertical
+                  flip) — see kiosk/hourglass.py's docstring.
 
 Rendering/staleness tuning (REFRESH_HZ, STALE_SEC, EASE_FACTOR,
 LINE_THICKNESS, X_RANGE_MM, Z_MIN_MM, Z_MAX_MM, Z_CENTER_EASE) all come
@@ -68,6 +85,8 @@ os.environ.setdefault("MIRROR", "1")
 _LEAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "leap")
 sys.path.insert(0, _LEAP_DIR)
 from flipdot_render import GRID, HandRenderer, REFRESH_HZ, STALE_SEC  # noqa: E402
+
+from hourglass import Hourglass  # idle animation; sits next to this file
 
 LISTEN_PORT = int(os.getenv("LISTEN_PORT", "5111"))
 FLIPDOT_SERIAL = os.getenv("FLIPDOT_SERIAL", "/dev/ttyS0")
@@ -134,10 +153,12 @@ def main():
     print(f"[attract_leap] flipdot serial on {FLIPDOT_SERIAL} @ {FLIPDOT_BAUD}")
 
     renderer = HandRenderer()
+    idle = Hourglass()
     last_hands = None
     last_packet_t = 0.0
     last_draw_t = 0.0
-    was_blank = True
+    was_active = None
+    last_sent = None
 
     while running:
         try:
@@ -161,13 +182,25 @@ def main():
 
         if now - last_draw_t >= MIN_INTERVAL:
             last_draw_t = now
-            if active:
-                _send_frame(ser, renderer.update(last_hands))
-                was_blank = False
-            elif not was_blank:
+
+            if active != was_active:
+                # Drop stale easing so a reappearing hand doesn't slide in
+                # from where the last one left, and restart the idle glass
+                # from a full top bulb rather than resuming mid-drain.
                 renderer.reset()
-                _send_frame(ser, _blank_frame())
-                was_blank = True
+                idle.reset()
+                was_active = active
+
+            frame = renderer.update(last_hands) if active else idle.frame(now)
+
+            # The idle animation only actually changes every ~0.5s, so at
+            # REFRESH_HZ most frames are identical to the one before. Sending
+            # those anyway would be pure serial traffic for a panel that's
+            # already showing them — and on hardware that flips physical
+            # discs, "draw nothing new" should cost nothing.
+            if frame != last_sent:
+                _send_frame(ser, frame)
+                last_sent = [row[:] for row in frame]
 
     print("\n[attract_leap] stopping, blanking panel")
     _send_frame(ser, _blank_frame())

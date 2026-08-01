@@ -424,6 +424,104 @@ Optional next tightening, only if false triggers show up in real use: set
 held edge-on. It's mount-dependent, so read the axis off
 `hi5_palm_debug.py`'s logged `palm_n=` values rather than deriving it.
 
+## Idle hourglass animation (2026-08-01)
+
+`attract_leap.py` used to blank the panel when no hand was present. It now
+draws `kiosk/hourglass.py` instead — sand draining from a top mass into a
+heap below over 60s, with loose grains visibly falling between them, a beat
+fully drained, then again, forever. This is what the panel shows the vast
+majority of the time. A hand appearing cuts straight to the live shadow;
+each return to idle restarts full rather than resuming mid-drain.
+
+**The glass is its two side curves**, and only those — horizontal caps
+across the top and bottom rows box the shape in. `HOURGLASS_OUTLINE=0`
+drops the outline and lets the sand's own edges carry the shape. The
+silhouette runs corner to corner, so a full heap blacks out the bottom
+line, and it tapers on a sine ease rather than a straight line (straight
+interpolation is geometrically correct but reads as a bowtie).
+
+**The turnover is an eased clockwise rotation**, not a cut. It lands on
+exactly 180 degrees, where a drained glass and a fresh one are the same
+image, so the loop closes seamlessly — verified at 0 differing cells. Two
+things make that work and are easy to break:
+
+- The outline is built **symmetric under point reflection** (lower half
+  mirrored from the upper, right wall from the left) rather than by running
+  Bresenham independently over each wall. Bresenham's tie-breaking isn't
+  symmetric under reflection, and drawing the walls separately left 24
+  cells that didn't survive the round trip — i.e. a visible pop at the loop.
+- During the turn the sand is forward-mapped as a bitmap but the outline is
+  transformed as *geometry* and redrawn with Bresenham. Forward-mapping a
+  one-cell-thick diagonal line while shrinking it drops neighbours and
+  leaves it dashed; that's fine for a filled area, not for a stroke.
+
+The shape runs corner to corner, so it's scaled by `1/(|cos|+|sin|)` during
+the turn — full size at 0 and 180, ~0.71 at 45 — or the corners would
+overhang the panel and be cut off. It also reads as tumbling rather than
+sliding. An earlier version outlined the glass and sold the
+turnover with an on-its-side flip beat; with nothing drawn to rotate, that
+beat read as a glitch and was replaced by a plain drained pause.
+
+It lives inside `attract_leap.py`'s process, not as a separate stage
+`run_kiosk.py` switches to, because **only one process can bind the Leap UDP
+port** — whatever draws the idle art has to be the same thing watching for
+hands. The FSM is untouched.
+
+Two details that are load-bearing on flipdot hardware specifically, and
+shouldn't be "simplified" away:
+
+- **The heap grows as a cone, not a rising level.** Bottom-bulb cells are
+  ordered by `depth-from-the-floor + distance-from-centre * REPOSE_SLOPE`,
+  whose equal-cost locus is a cone — so sand mounds up in the middle and
+  spreads sideways as it gains height, at roughly sand's real angle of
+  repose. Still a fixed prefix ordering, so the heap stays monotonic.
+- **Sand is placed by cell count, not by row.** A 60s cycle across 28 rows
+  would step once every ~2.1s, which reads as a stutter; by grain it's one
+  every ~0.4s, and the boundary row fills as scattered grains (the dither).
+  That ordering is deterministic and monotonic *on purpose* — a placed grain
+  never moves, so the two masses never flicker.
+- **`attract_leap.py` skips sending a frame identical to the last one.**
+  Cheap insurance, though the falling grains mean far fewer frames repeat
+  now than when the sand alone moved.
+
+One full period is 120s drain + 0.25s hold + 0.8s turn. Cost is ~4420
+dot-flips, i.e. ~2190/minute, of which the turn itself is ~1750 in one
+0.8s burst.
+
+Sand cells that the outline already covers are excluded from the grain
+ordering (`_interior`). Without that, the last ~2 seconds of every drain
+were spent placing grains hidden underneath the outline — the panel looked
+frozen while the animation thought it was still working. Combined with the
+shorter hold, the dead time before the turn went from 3.6s to 0.5s. The falling grains are most of the rest; `HOURGLASS_STREAM=0`
+quietens things considerably if the clicking is ever unwelcome.
+
+`HOURGLASS_ROTATE_SEC` (0.8) and `HOURGLASS_ROTATE_STEPS` (14) are the turn
+knobs — duration and smoothness, independently. At the current pairing each
+step gets 57ms, which is on the fast side of what the discs can settle in;
+if the turn ever looks smeared rather than crisp, drop to `--steps 8` for
+~100ms per step at the same duration. Tune either with
+
+    python3 kiosk/hourglass.py --panel --turn-only --rotate 1.2
+
+which replays just the turnover on a loop instead of making you sit
+through a full drain to see it. Flipdots click, so if the
+install ends up somewhere quiet, `HOURGLASS_STREAM_GRAINS` (default 3)
+trims it proportionally and `HOURGLASS_STREAM=0` removes the grains
+entirely, leaving the masses drifting silently.
+
+Verified by decoding the panel bytes back off a pty: the idle animation
+runs, a hand cuts to the shadow, and idle resumes with a full top mass
+(measured: drained to 10%, then back to 100%). The full FSM
+(attract → trigger → hi-5 → QR) still passes.
+
+**Confirmed on the real panel 2026-08-01** — drain, coning heap, falling
+grains and the turnover all watched on the hardware and correct, at the
+shipped defaults (120s drain, 0.25s hold, 0.8s turn in 14 steps, outline
+on). Orientation came out right way up as authored, so
+`HOURGLASS_FLIP_VERTICAL` stays off; it's there if the panel is ever
+remounted. Preview without hardware:
+`python3 kiosk/hourglass.py --cycle 6 --fps 4`.
+
 ## Not yet done / open ends
 
 - **Orientation is now confirmed**: `PROJECT_AXES=x,z` + `GRID_ROTATE=180`
