@@ -7,8 +7,18 @@ rendering as a live skeleton on the physical flipdot panel. Confirmed
 working end to end. This doc exists so a fresh chat can pick up the "make
 it more fun / snappy" work without re-deriving the setup.
 
-Not wired into `hi5_final.py` / `run_kiosk.py` at all — everything here is
-a standalone side-track, separate from the HuskyLens-based kiosk pipeline.
+**Update (2026-08-01): this is now wired into the kiosk.** `kiosk/run_kiosk.py`
+uses a new `kiosk/attract_leap.py` (presence + hand-shadow, one process,
+reusing `flipdot_render.py`'s `HandRenderer`) for the attract stage, and
+`kiosk/hi5_final.py`'s hand-gesture detection now reads this same UDP feed
+instead of the HuskyLens. HuskyLens is no longer the kiosk's default sensor
+for either stage — the old `cam_v2.py`/`attract_v2.py`/`attract_outline.py`
+scripts are still in the repo but unused by default, kept as reference. See
+"Wired into the kiosk" below for what changed and what's still untested.
+The rest of this document (below) describes the standalone `leap/` demo
+scripts this integration is built on top of — `leap_flipdot_preview.py`,
+`leap_visualizer.py`, etc. are unchanged and still useful for isolating
+rendering/orientation issues from kiosk-integration issues.
 
 **Currently running on the Pi** (background, via the relay setup below):
 `leap_udp_relay.py`, `leap_flipdot_preview.py` (`LISTEN_PORT=5112,
@@ -268,6 +278,47 @@ predate the `beelink/leap_sender.py` rewrite and aren't wired to
 `synthetic_hand_test.py` exercises the current pipeline without checking
 the schema match first — it currently doesn't.
 
+## Wired into the kiosk (2026-08-01)
+
+`run_kiosk.py` now uses this pipeline as its only sensor, for both stages:
+
+- **Attract stage**: `kiosk/attract_leap.py` (new) replaces `cam_v2.py` +
+  `attract_v2.py`/`attract_outline.py` with a single process — presence
+  detection and hand-shadow rendering merged into one, since (unlike
+  HuskyLens's I2C bus) nothing about UDP requires split ownership across
+  two processes. It reuses `flipdot_render.py`'s `HandRenderer` directly
+  (same rendering as `leap_flipdot_preview.py`) and writes
+  `/tmp/cam_state.json` in the same schema `cam_v2.py` used to, so
+  `run_kiosk.py`'s trigger logic needed no changes.
+- **Hi-5 stage**: `kiosk/hi5_final.py`'s hand-open detection now reads this
+  same UDP feed instead of polling the HuskyLens over I2C — only the
+  landmark *source* changed; the palm-fill rendering, hold timer, and QR
+  chaining are untouched.
+- Verified end-to-end against `simulator/flipdot_simulator.py` and a new
+  `leap/synthetic_leap_udp_sender.py` (procedurally animated hand over the
+  real UDP schema, not to be confused with the older, incompatible
+  `synthetic_hand_test.py`) — full `RUN_KIOSK → HI5 → WAIT_ANIM` cycle
+  confirmed working. **Not yet run against the real Beelink feed or
+  physical panel** — do that before trusting it live.
+- `DIST_MARGIN` (default `3`) and `MIN_HAND_AREA` (default `5000`) in
+  `hi5_final.py` were tuned for HuskyLens's pixel-space landmarks; Leap's
+  are real-world millimeters, so these are almost certainly wrong now —
+  retune against a real hand before relying on the bbox-area fallback path.
+- `run_kiosk.py`'s `WARMUP_SEC`/`TRIGGER_HOLD_SEC` (1.0s/10.0s) were tuned
+  for HuskyLens's room-scale approach detection. Leap only sees a hand once
+  it's already close to the panel, so these multi-second windows will
+  likely feel sluggish for that near-field interaction — retune live.
+- **Found, not fixed** (pre-existing, predates this session, confirmed via
+  `git show HEAD:kiosk/hi5_final.py` — not introduced by the Leap swap):
+  `hi5_final.py`'s presence-grace logic (`PRESENCE_GRACE_SEC` handling,
+  around the `presence_now = presence_now or (...)` line) re-stamps its own
+  timestamp anchor using the grace-extended value, not just the raw signal —
+  so once presence is ever true even once (including the very first grace
+  window at cold start), the grace window perpetually renews itself and
+  `IDLE_ABORT_SEC` can never actually fire. Affects both sensor backends
+  identically; out of scope for the Leap integration, flagged here for
+  whoever picks it up next.
+
 ## Not yet done / open ends
 
 - **Orientation is now confirmed**: `PROJECT_AXES=x,z` + `GRID_ROTATE=180`
@@ -286,9 +337,10 @@ the schema match first — it currently doesn't.
   shape are done. Still no reaction to open/closed palm state (e.g. a
   distinct look on hi-5/spread vs. fist beyond the shape itself) — that's
   the remaining "make it more fun" surface area for the next session.
-- `leap_receiver.py`'s `/tmp/leap_state.json` output (schema close to
-  `cam_v2.py`'s `/tmp/cam_state.json`) hasn't been consumed by anything
-  yet — it's there for whenever this gets wired into the real kiosk flow,
-  but that's explicitly out of scope for now per this session's direction.
+- `leap_receiver.py`'s `/tmp/leap_state.json` output is a separate,
+  still-unused debug artifact — `attract_leap.py`/`hi5_final.py` read the
+  UDP feed directly, not this file.
 - No systemd service / autostart — everything's being run manually in a
-  terminal for now.
+  terminal for now, on both the Pi and the Beelink.
+- See "Wired into the kiosk" above for the current integration's open ends
+  (retuning, real-hardware verification).

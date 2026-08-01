@@ -11,11 +11,15 @@ def _log_line(s: str):
 
 # ---------- Config (env-tweakable) ----------
 SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
-CAM_SCRIPT     = os.getenv("CAM_SCRIPT",     os.path.join(SCRIPT_DIR, "cam_v2.py"))
 HI5_SCRIPT     = os.getenv("HI5_SCRIPT",     os.path.join(SCRIPT_DIR, "hi5_final.py"))
-ATTRACT_SCRIPT = os.getenv("ATTRACT_SCRIPT", os.path.join(SCRIPT_DIR, "attract_outline.py"))
+ATTRACT_SCRIPT = os.getenv("ATTRACT_SCRIPT", os.path.join(SCRIPT_DIR, "attract_leap.py"))
 
 CAM_SIGNAL_PATH     = os.getenv("CAM_SIGNAL_PATH", "/tmp/cam_state.json")
+# Tuned for HuskyLens's room-scale approach detection (someone walking up
+# from across the room). attract_leap.py's Leap Motion feed only sees a
+# hand once it's already within ~10-40cm of the panel, so this multi-second
+# warmup/hold window will likely feel sluggish for that near-field
+# presence — retune live against real hardware rather than guessing here.
 TRIGGER_HOLD_SEC    = float(os.getenv("TRIGGER_HOLD_SEC", "10.0"))   # presence to promote -> HI5
 
 ACTIVE_STALE_SEC    = float(os.getenv("ACTIVE_STALE_SEC", "2.0"))   # heartbeat freshness from cam
@@ -27,7 +31,7 @@ SCAN_GRACE_SEC      = float(os.getenv("SCAN_GRACE_SEC", "120.0"))
 ANIM_WAIT_TIMEOUT   = float(os.getenv("ANIM_WAIT_TIMEOUT", "300.0"))# safety cap
 COOLDOWN_AFTER_ANIM = float(os.getenv("COOLDOWN_AFTER_ANIM", "1.0"))# small breather
 
-WARMUP_SEC          = float(os.getenv("WARMUP_SEC", "1.0"))         # seconds of motion before hold
+WARMUP_SEC          = float(os.getenv("WARMUP_SEC", "1.0"))         # seconds of motion before hold — see TRIGGER_HOLD_SEC note above, same retuning caveat applies
 WARMUP_DELTA_MIN    = float(os.getenv("WARMUP_DELTA_MIN", "0"))     # cam_v2 always writes delta_ema=0; gate is the active flag
 
 POLL_SLEEP_KIOSK    = float(os.getenv("POLL_SLEEP_CAM", "0.05"))
@@ -81,27 +85,22 @@ def _hard_kill(pattern):
         pass
 
 def _wait_for_pattern_gone(pattern, timeout=5.0):
-    # cam_v2.py's I2C reads can block in-kernel (uninterruptible D-state) —
-    # SIGKILL is only delivered once that syscall returns, so a killed
-    # process can keep holding the bus for a couple seconds after we think
-    # it's dead. hi5_final.py starting its own I2C traffic (SET_ALGORITHM)
-    # while cam_v2 is still mid-transaction was observed to corrupt/lose the
-    # algorithm switch silently (HuskyLens screen stayed on Pose Recognition
-    # even though the switch appeared to ack). Block here until the process
-    # is actually gone instead of assuming a signal was enough.
+    # Originally written for HuskyLens: I2C reads can block in-kernel
+    # (uninterruptible D-state), so SIGKILL is only delivered once that
+    # syscall returns, and a killed process could keep holding the bus for a
+    # couple seconds after we think it's dead — starting new I2C traffic
+    # while the old process was still mid-transaction was observed to
+    # corrupt/lose an algorithm switch silently. Now that the kiosk's sensor
+    # pipeline is UDP-based (see kiosk/attract_leap.py, kiosk/hi5_final.py),
+    # this is generic "don't start the next stage until this one's fully
+    # gone" insurance rather than an I2C-specific requirement — still cheap,
+    # still worth keeping.
     t0 = time.time()
     while (time.time() - t0) < timeout:
         r = subprocess.run(["pgrep", "-f", pattern], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if r.returncode != 0:  # no match => nothing left running
             return
         time.sleep(0.1)
-
-def _ensure_cam_stopped(cam_proc):
-    if _is_alive(cam_proc):
-        _grace_stop(cam_proc)
-    _hard_kill(r"/cam_v2\.py")
-    _wait_for_pattern_gone(r"/cam_v2\.py")
-    return None
 
 def _ensure_attract_stopped(attract_proc):
     if _is_alive(attract_proc):
@@ -113,11 +112,13 @@ def _ensure_hi5_stopped(hi5_proc):
     if _is_alive(hi5_proc):
         _grace_stop(hi5_proc)
     _hard_kill(r"/hi5_final\.py")
-    # Same I2C-mid-transaction lingering risk as cam_v2.py (see
-    # _ensure_cam_stopped) — hi5_final.py's read loop can also block in
-    # uninterruptible D-state when force-killed (idle timeout, or an
-    # animation pre-empting it), and cam_v2.py connecting right after would
-    # race it back to POSE_RECOGNITION the same way.
+    # Historically guarded against cam_v2.py's HuskyLens I2C connect racing
+    # a not-yet-dead hi5_final.py over the same bus (a force-killed process
+    # can linger in uninterruptible D-state after SIGKILL). Now that both
+    # sides of the kiosk sensor pipeline are UDP-based, this is a generic
+    # "don't start the next stage until this one's fully gone" safety wait
+    # rather than an I2C-specific requirement — kept because it's still
+    # cheap insurance, not because the original race is still possible.
     _wait_for_pattern_gone(r"/hi5_final\.py")
     return None
 
@@ -144,7 +145,7 @@ def _get_api_status():
 def main():
     # States: RUN_KIOSK → HI5 → WAIT_ANIM → RUN_KIOSK
     STATE = "RUN_KIOSK"
-    cam = hi5 = attract = None
+    hi5 = attract = None
     hold_t0 = warmup_t0 = None
     print("[KIOSK] boot…")
     # Remove stale cam_state.json so an old active=True can't instantly trigger hi5
@@ -168,14 +169,11 @@ def main():
     while True:
         # ---------------- RUN_KIOSK (camera-driven scanning) ----------------
         if STATE == "RUN_KIOSK":
-            # Ensure camera and attract are running
-            if cam is None or cam.poll() is not None:
-                print("[KIOSK] launching camera…")
-                cam = _spawn_py(CAM_SCRIPT)
-                hold_t0 = warmup_t0 = None
+            # Ensure attract (presence + shadow, all in one process now) is running
             if attract is None or attract.poll() is not None:
                 print("[KIOSK] launching attract…")
                 attract = _spawn_py(ATTRACT_SCRIPT)
+                hold_t0 = warmup_t0 = None
 
             st = _read_cam_state()
             # Pre-empt CAM if an animation is active/pending while we're in RUN_KIOSK
@@ -187,8 +185,7 @@ def main():
                 last_done    = float(st_api.get("last_done_ts", 0.0))
 
                 if running or q > 0 or (last_started > last_done):
-                    print("[KIOSK] animation detected during RUN_KIOSK → killing CAM+attract and handing to anim")
-                    cam     = _ensure_cam_stopped(cam)
+                    print("[KIOSK] animation detected during RUN_KIOSK → killing attract and handing to anim")
                     attract = _ensure_attract_stopped(attract)
                     # Enter WAIT in override mode (grace killed)
                     STATE = "WAIT_ANIM"
@@ -212,11 +209,10 @@ def main():
                 if (now - warmup_t0) >= WARMUP_SEC:
                     hold_t0 = hold_t0 or now
                     if (now - hold_t0) >= TRIGGER_HOLD_SEC:
-                        print("[KIOSK] trigger met → stopping CAM+attract + spawning HI5")
+                        print("[KIOSK] trigger met → stopping attract + spawning HI5")
                         t_kill  = time.time()
-                        cam     = _ensure_cam_stopped(cam)
                         attract = _ensure_attract_stopped(attract)
-                        print(f"[KIOSK] CAM+attract stop done in {time.time()-t_kill:.3f}s → spawning HI5…")
+                        print(f"[KIOSK] attract stop done in {time.time()-t_kill:.3f}s → spawning HI5…")
                         t_spawn = time.time()
                         hi5 = _spawn_py(HI5_SCRIPT)
                         print(f"[KIOSK] spawned HI5 pid={hi5.pid} in {time.time()-t_spawn:.3f}s")
@@ -231,8 +227,7 @@ def main():
 
         # ---------------- HI5 (QR screen) ----------------
         elif STATE == "HI5":
-            # Make absolutely sure camera and attract are not running while QR/anim flow is active
-            cam     = _ensure_cam_stopped(cam)
+            # Make absolutely sure attract is not running while QR/anim flow is active
             attract = _ensure_attract_stopped(attract)
 
             # If an animation is triggered while HI5 is playing, kill HI5 immediately
@@ -319,9 +314,8 @@ def main():
                     anim_started_seen = True
                     if last_started > 0.0:
                         last_started_seen = max(last_started_seen, last_started)
-                    # Once anything is seen, KILL grace and keep CAM/HI5 dead
+                    # Once anything is seen, KILL grace and keep attract/HI5 dead
                     pre_anim_mode = False
-                    cam     = _ensure_cam_stopped(cam)
                     attract = _ensure_attract_stopped(attract)
                     hi5     = _ensure_hi5_stopped(hi5)
 

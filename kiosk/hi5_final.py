@@ -14,20 +14,23 @@ Common env:
   SCROLL_STEP ("1"), SCROLL_DELAY ("0.1"), FONT_SPACING ("1")
   BIG_HI_PAUSE ("1.2"), TUI ("0")
 
-Palm detection — landmarks come from the HuskyLens's built-in
-ALGORITHM_HAND_RECOGNITION (camera hardware was swapped for the HuskyLens;
-see STATUS.md — this used to run Picamera2 + MediaPipe Hands, which has no
-camera to read from anymore). HuskyLens reports the same 21-point wrist-first
-landmark layout MediaPipe uses, so the open-palm geometry below is unchanged,
-just fed HuskyLens landmarks instead. Landmarks are raw sensor pixel
-coordinates (HuskyLens doesn't report its working resolution), so
-DIST_MARGIN/MIN_HAND_AREA are in pixel units now, not the old 0..1 fraction
-— defaults are a starting point, expect to retune on real hardware:
+Palm detection — landmarks come from a Leap Motion Controller (a Beelink
+Windows PC runs the actual sensor + Ultraleap tracking and streams UDP to
+this Pi; see LEAP_HANDOFF.md), not the HuskyLens or the original
+Picamera2 + MediaPipe Hands setup (see STATUS.md for that history). The
+Leap feed's wire schema uses the same 21-point wrist-first landmark
+layout MediaPipe/HuskyLens used, so the open-palm geometry below is
+unchanged, just fed Leap landmarks instead. Landmarks are real-world
+millimeters now, not HuskyLens's raw sensor pixels, so DIST_MARGIN/
+MIN_HAND_AREA are almost certainly wrong at their old pixel-tuned
+defaults — expect to retune both against real hardware before trusting
+them:
   ANGLE_PIP_THRESH_DEG ("130"), ANGLE_DIP_THRESH_DEG ("118"), DIST_MARGIN ("3")
   RELAX_TWO_FINGERS ("1")
 
-HuskyLens:
-  HUSKYLENS_I2C_BUS ("1"), HUSKYLENS_I2C_ADDR ("0x50")
+Leap Motion feed:
+  LISTEN_PORT ("5111")     — UDP port, must match beelink/leap_sender.py's RPI_PORT
+  UDP_STALE_SEC ("0.5")    — treat the hand as gone if no packet arrives within this window
 
 Timing / smoothing:
   LOOP_SLEEP_SEC ("0.03")
@@ -172,9 +175,9 @@ ANGLE_DIP_THRESH_DEG = float(os.getenv("ANGLE_DIP_THRESH_DEG", "118"))
 DIST_MARGIN          = float(os.getenv("DIST_MARGIN", "3"))  # pixels, not 0..1 fraction
 RELAX_TWO_FINGERS    = os.getenv("RELAX_TWO_FINGERS", "1") == "1"
 
-# HuskyLens
-HUSKYLENS_I2C_BUS  = int(os.getenv("HUSKYLENS_I2C_BUS", "1"))
-HUSKYLENS_I2C_ADDR = int(os.getenv("HUSKYLENS_I2C_ADDR", "0x50"), 16)
+# Leap Motion UDP feed
+LISTEN_PORT   = int(os.getenv("LISTEN_PORT", "5111"))
+UDP_STALE_SEC = float(os.getenv("UDP_STALE_SEC", "0.5"))
 
 # Timing / smoothing
 LOOP_SLEEP_SEC   = float(os.getenv("LOOP_SLEEP_SEC", "0.03"))
@@ -398,20 +401,22 @@ def compose_fill_frame_from_filled(outline, filled, cutoff_row: int):
 # ============== TUI ==============
 def tui_clear(): print("\x1b[2J\x1b[H", end="")
 def tui_print_preview(detected: bool, progress: float, presence: bool):
-    # No raw camera frame available (HuskyLens does on-device detection
-    # only) — just a status line + progress bar, no ASCII image.
+    # No raw camera frame available (Leap does on-device tracking only,
+    # we just get landmark coordinates) — just a status line + progress
+    # bar, no ASCII image.
     if not TUI: return
     tui_clear()
     title = "HI-5!" if detected else ("(presence)" if presence else "…")
-    print("HuskyLens hand tracking —", title)
+    print("Leap Motion hand tracking —", title)
     width = 30
     n = int(max(0.0, min(1.0, progress)) * width)
     print(f"\nHold progress: [{'='*n}{' '*(width-n)}]  {progress*100:4.0f}%")
 
 # ============== Hand + Presence helpers ==============
 class _LM:
-    """Minimal MediaPipe-landmark-shaped (.x/.y) point, fed from HuskyLens
-    HandResult landmarks so is_open_palm() etc. don't need to change."""
+    """Minimal MediaPipe-landmark-shaped (.x/.y) point, fed from whichever
+    21-point landmark source is wired in (currently Leap Motion over UDP)
+    so is_open_palm() etc. don't need to change."""
     __slots__ = ("x", "y")
     def __init__(self, x, y):
         self.x = x
@@ -496,19 +501,15 @@ def main():
     time.sleep(0.8)
     print(f"Palm prompt shown. Starting camera + detection… (hold {HOLD_REQUIRED_SEC:.1f}s)")
 
-    # --- Lazy import: only load once we actually need the sensor ---
-    from DFRobot_HuskyLens import DFRobot_HuskyLens_I2C, ALGORITHM_HAND_RECOGNITION
+    # --- Leap Motion UDP listener (Beelink PC -> UDP -> Pi). Safe to bind
+    # the same port attract_leap.py uses — run_kiosk.py's state machine
+    # guarantees that process is fully stopped before this one starts. ---
+    import socket as _socket
 
-    hl = DFRobot_HuskyLens_I2C(bus=HUSKYLENS_I2C_BUS, addr=HUSKYLENS_I2C_ADDR)
-    for attempt in range(10):
-        if hl.begin():
-            break
-        _log(f"[HI5] HuskyLens connect attempt {attempt + 1}/10 failed, retrying…")
-        time.sleep(1)
-    else:
-        fatal("ERROR: could not connect to HuskyLens.")
-    if not hl.write_algo(ALGORITHM_HAND_RECOGNITION):
-        fatal("ERROR: HuskyLens never confirmed switching to hand recognition.")
+    _sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    _sock.bind(("0.0.0.0", LISTEN_PORT))
+    _sock.settimeout(0.05)
+    _log(f"[HI5] UDP listener on :{LISTEN_PORT}")
 
     hold_start = None
     satisfied = False
@@ -517,6 +518,8 @@ def main():
     presence_run_start = None
     absence_run_start  = time.time()
     smoothed_hit = 0.0
+    last_hands = None
+    last_hand_seen_udp_t = 0.0
 
     # logging state (NEW)
     last_log_ms = _now_ms()
@@ -525,20 +528,23 @@ def main():
 
     while True:
         try:
-            got = hl.request()
-        except Exception as e:
-            _log(f"[HI5] HuskyLens read error: {e}")
-            time.sleep(0.2)
-            continue
+            data, _addr = _sock.recvfrom(8192)
+            payload = json.loads(data.decode("utf-8"))
+            last_hands = payload.get("hands")
+            if last_hands:
+                last_hand_seen_udp_t = time.time()
+        except _socket.timeout:
+            pass
+        except (OSError, json.JSONDecodeError) as e:
+            _log(f"[HI5] UDP read error: {e}")
 
         open_palm_now = False
-        hand_present_now = False
+        hand_present_now = bool(last_hands) and (time.time() - last_hand_seen_udp_t) <= UDP_STALE_SEC
         reason = "idle"
 
-        if got and hl.count_blocks() > 0:
-            hand_present_now = True
-            block = hl.blocks()[0]  # largest/first hand only (MAX_HANDS=1 equivalent)
-            lm = [_LM(x, y) for x, y in block.landmarks]
+        if hand_present_now:
+            hand = last_hands[0]  # first/preferred hand only (MAX_HANDS=1 equivalent)
+            lm = [_LM(x, y) for x, y in hand["landmarks"]]
             # Primary: palm geometry
             if is_open_palm(lm):
                 open_palm_now = True
@@ -555,10 +561,17 @@ def main():
         PRESENCE_GRACE_SEC = float(os.getenv("PRESENCE_GRACE_SEC", "0.8"))
         if presence_now:
             last_presence_time = now
+        # Grace-extended presence: still count as "present" for a short
+        # window after the last *real* sighting (hand_present_now), so a
+        # one-frame dropout doesn't immediately read as absence.
+        # last_presence_time must only ever be set from a real detection
+        # (above) — NOT re-stamped just because we're currently inside the
+        # grace window (that used to happen below), or the window would
+        # perpetually re-arm itself off its own truthiness and absence could
+        # never accumulate, making IDLE_ABORT_SEC unreachable.
         presence_now = presence_now or ((now - last_presence_time) <= PRESENCE_GRACE_SEC)
 
         if presence_now:
-            last_presence_time = now
             absence_run_start = None
             if presence_run_start is None:
                 presence_run_start = now

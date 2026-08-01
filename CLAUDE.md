@@ -47,9 +47,12 @@ depth than you would code-level ones.
   `leap_flipdot_preview.py`, `leap_visualizer.py`, shared `flipdot_render.py`).
   `leap/leapc-python-bindings/` is an untracked vendored clone — never stage it.
 - `beelink/` — reference copy of the Beelink's sender script (see "Three machines").
-- `kiosk/` — the HuskyLens kiosk pipeline: `run_kiosk.py` (orchestrator/FSM),
-  `cam_v2.py`, `attract_v2.py`, `hi5_final.py`, `qr_works.py`,
-  `DFRobot_HuskyLens.py` + `vendor/`. The Leap work is NOT wired into this yet.
+- `kiosk/` — the kiosk pipeline: `run_kiosk.py` (orchestrator/FSM),
+  `attract_leap.py` (Leap presence + hand-shadow, one process, replaces the
+  old `cam_v2.py`+`attract_v2.py` pair), `hi5_final.py` (now Leap-fed),
+  `qr_works.py`. `cam_v2.py`, `attract_v2.py`, `attract_outline.py`,
+  `DFRobot_HuskyLens.py` + `vendor/` are the retired HuskyLens pipeline —
+  still present, not wired in by default, kept as reference/fallback.
 - `animations/`, `api/` — flipdot animation library and the Flask queue that
   serves it.
 - `simulator/` — virtual flipdot panel + browser renderer, for testing without
@@ -59,35 +62,44 @@ depth than you would code-level ones.
 
 ## Branches
 
-- `leapmotion` (current) is the active direction: Leap Motion hand tracking
-  (Beelink → UDP → Pi → panel), replacing/supplementing the HuskyLens. Treat it
-  as current work, not a throwaway experiment.
-- `main` / `v2` / `flip.simulator` are prior stages. Default to whatever branch
-  is currently checked out unless told otherwise.
+- `leapmotion` has been merged into `main`; Leap Motion hand tracking
+  (Beelink → UDP → Pi → panel) is now wired into `run_kiosk.py` for both the
+  attract/shadow stage and hi-5, fully replacing the HuskyLens by default
+  (see "Structure" above and `LEAP_HANDOFF.md`).
+- `v2` / `flip.simulator` are prior stages. Default to whatever branch is
+  currently checked out unless told otherwise.
 
 ## Running
 
     pip install -r requirements.txt
-    python3 kiosk/run_kiosk.py               # HuskyLens state machine
+    python3 kiosk/run_kiosk.py               # kiosk state machine (Leap-fed by default)
     python3 api/flipdot-api.py               # animation queue API, separate process
     python3 simulator/flipdot_simulator.py   # virtual panel at :5050, no hardware needed
 
-For the Leap pipeline (relay + panel + browser preview, and the Beelink-side
-PowerShell setup), follow the "Full relaunch cheat sheet" in `LEAP_HANDOFF.md`
-exactly — start the Pi-side listeners before the Beelink sender.
+`run_kiosk.py` needs a live Leap Motion UDP feed arriving on `LISTEN_PORT`
+(default 5111) to do anything — that means the Beelink PC's `leap_sender.py`
+needs to actually be running (see "Three machines" above and the "Full
+relaunch cheat sheet" in `LEAP_HANDOFF.md`). No feed = no crash, just a
+kiosk that silently never detects presence. For hardware-free testing, use
+`leap/synthetic_leap_udp_sender.py` in place of the Beelink instead.
 
 ## Known gotchas
 
-- **HuskyLens I2C is genuinely flaky at the firmware level** — algorithm-switch
-  failures, bus drop-offs, and corrupted landmark reads are confirmed hardware
-  behavior, not necessarily a code bug. Check `HANDOFF.md` before assuming a
-  fresh bug.
+- **HuskyLens I2C is genuinely flaky at the firmware level** (relevant only if
+  reviving the retired HuskyLens scripts) — algorithm-switch failures, bus
+  drop-offs, and corrupted landmark reads are confirmed hardware behavior,
+  not necessarily a code bug. Check `HANDOFF.md` before assuming a fresh bug.
 - **Don't run `run_kiosk.py` twice** — a second instance fights the first over
-  the same I2C bus/serial port. Check
-  `ps aux | grep -E "run_kiosk|cam_v2|attract_|hi5_final"` first.
-- Killed camera/hand-detection processes can sit in D-state for a couple seconds
-  after SIGKILL (blocking I2C read mid-flight). `run_kiosk.py` already waits for
-  this (`_wait_for_pattern_gone()`) — don't remove it to "speed things up."
+  the same UDP port (5111) and serial port. Check
+  `ps aux | grep -E "run_kiosk|attract_leap|hi5_final"` first.
+- `run_kiosk.py` waits for a killed process to actually disappear before
+  starting the next one (`_wait_for_pattern_gone()`) rather than assuming a
+  signal was enough — originally guarded against HuskyLens I2C D-state
+  lingering, now just generic "don't start the next stage early" insurance.
+  Don't remove it to "speed things up."
+- `attract_leap.py`'s entire presence signal now depends on the Beelink PC
+  actually running `leap_sender.py` — if it's down, the kiosk doesn't error,
+  it just never sees anyone (see "Running" above).
 - Only one process can bind a UDP port — the panel driver and browser preview
   can't both listen on 5111; run them through `leap_udp_relay.py`
   (see `LEAP_HANDOFF.md`, including the browser hard-refresh gotcha).
