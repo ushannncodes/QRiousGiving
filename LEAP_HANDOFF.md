@@ -22,16 +22,18 @@ scripts this integration is built on top of — `leap_flipdot_preview.py`,
 `leap_visualizer.py`, etc. are unchanged and still useful for isolating
 rendering/orientation issues from kiosk-integration issues.
 
-**Currently running on the Pi** (background, via the relay setup below):
-`leap_udp_relay.py`, `leap_flipdot_preview.py` (`LISTEN_PORT=5112,
-GRID_ROTATE=180, MIRROR=1`), and `leap_visualizer.py` (`LISTEN_PORT=5113,
-HTTP_PORT=8090, GRID_ROTATE=180, MIRROR=1`) — started to debug why the
+**Currently running on the Pi** (checked 2026-08-01): only
+`flipdot-api.service`. The kiosk itself (`runkiosk.service`) is stopped,
+and none of the `leap/` debug scripts are up. Earlier sessions left
+`leap_udp_relay.py` + `leap_flipdot_preview.py` (`LISTEN_PORT=5112,
+GRID_ROTATE=180, MIRROR=1`) + `leap_visualizer.py` (`LISTEN_PORT=5113,
+HTTP_PORT=8090, GRID_ROTATE=180, MIRROR=1`) running to debug why the
 panel was showing round blobs instead of a hand shape, then wrong
 orientation, then a mirrored thumb, by comparing the raw capture against
 the flipdot simulation live. **Status: orientation confirmed correct
 on real hardware with `GRID_ROTATE=180, MIRROR=1`** (see "Where things
-stand" below). Kill and restart per the cheat sheet below if a fresh
-session needs to pick this back up.
+stand" below), so that relay setup is only worth restarting (per the
+cheat sheet below) if orientation or rendering needs debugging again.
 
 **Browser-cache gotcha:** the flipdot pane is computed fresh server-side
 on every request, but the raw-capture pane's rotate/mirror logic is JS
@@ -258,6 +260,40 @@ see "Where things stand on orientation" above. After restarting
 `leap_visualizer.py`, hard-refresh the browser tab (see "Browser-cache
 gotcha" above) before judging whether it looks right.
 
+### Starting the kiosk itself
+
+The block above starts the standalone `leap/` *debug* scripts. To run the
+actual kiosk, start `leap_sender.py` on the Beelink as above, then on the
+Pi:
+
+```bash
+sudo systemctl start flipdot-api.service   # usually already running
+sudo systemctl start runkiosk.service
+journalctl -u runkiosk.service -f
+```
+
+Both units are pointed at this repo by `.d/override.conf` drop-ins, which
+also supply `SERIAL_PORT=/dev/ttyS0`, `FLIPDOT_BAUD=57600` and
+`DEBUG_LOG=1`. **The base unit files still name stale standalone copies at
+`/home/pi/Desktop/run_kiosk.py` and `/home/pi/Desktop/flipdot-api.py`
+(last touched Aug/Sep 2025)** — only the drop-ins keep production on the
+repo. If a drop-in is ever lost, the kiosk will start cleanly and run
+year-old code, with nothing obviously wrong in the logs. Confirm what's
+actually loaded with `systemctl status runkiosk.service`, which prints the
+resolved binary path.
+
+To run it in a terminal instead — for Ctrl+C and env-var tweaking — stop
+the service first, or the two fight over `/dev/ttyS0` and UDP 5111, and
+replicate the env the drop-in supplies:
+
+```bash
+sudo systemctl stop runkiosk.service
+ps aux | grep -E "run_kiosk|attract_leap|hi5_final" | grep -v grep   # expect nothing
+cd ~/QRiousGiving/kiosk
+SERIAL_PORT=/dev/ttyS0 FLIPDOT_SERIAL=/dev/ttyS0 FLIPDOT_BAUD=57600 \
+  DEBUG_LOG=1 python3 -u run_kiosk.py
+```
+
 ## Tunable knobs, for the "make it more fun" pass
 
 All via env vars, no code edits needed for quick experiments:
@@ -349,8 +385,12 @@ the schema match first — it currently doesn't.
   `leap/synthetic_leap_udp_sender.py` (procedurally animated hand over the
   real UDP schema, not to be confused with the older, incompatible
   `synthetic_hand_test.py`) — full `RUN_KIOSK → HI5 → WAIT_ANIM` cycle
-  confirmed working. **Not yet run against the real Beelink feed or
-  physical panel** — do that before trusting it live.
+  confirmed working. **Since confirmed on the real Beelink feed and
+  physical panel too**: a real hand drives attract → trigger → hi-5 → QR
+  end to end (see "Hi-5 detection rebuilt on Leap pose signals"), and the
+  idle animation was confirmed on the panel separately (see "Idle
+  hourglass animation"). The retuning caveats immediately below are still
+  open — "it runs on hardware" is not "the timings feel right".
 - `DIST_MARGIN` (default `3`) and `MIN_HAND_AREA` (default `5000`) in
   `hi5_final.py` were tuned for HuskyLens's pixel-space landmarks; Leap's
   are real-world millimeters, so these are almost certainly wrong now —
@@ -423,6 +463,23 @@ Optional next tightening, only if false triggers show up in real use: set
 `PALM_FACING_AXIS` to require a palm actually facing the panel rather than
 held edge-on. It's mount-dependent, so read the axis off
 `hi5_palm_debug.py`'s logged `palm_n=` values rather than deriving it.
+
+## QR stage — the live donation target (2026-08-01)
+
+`kiosk/qr_works.py` now points at **`qrgiving.framer.ai`**, replacing the
+old `bit.ly/qriousgiving` short link. Overridable via the `QR_TEXT` env
+var. Verified end to end: it generates at version 2 (25x25, same as the
+old link) and decodes back to the new URL.
+
+The one thing not to undo: **the URL is scheme-less on purpose.** The
+panel is 28x28 and `generate_qr_image()` has a hard-coded 25x25 copy
+loop, so a version-2 code is the ceiling. Adding `https://` pushes it to
+version 3 (29x29), which that loop crops into something that still looks
+like a QR code but no longer scans — a silent failure, not an error. Any
+future URL change should be checked by decoding the generated image back,
+not by eyeballing the panel. Longer URLs that don't fit can drop to
+`ERROR_CORRECT_L` to get back into version 2. The full reasoning is in
+the comment above `QR_TEXT`.
 
 ## Idle hourglass animation (2026-08-01)
 
@@ -546,8 +603,13 @@ remounted. Preview without hardware:
 - `leap_receiver.py`'s `/tmp/leap_state.json` output is a separate,
   still-unused debug artifact — `attract_leap.py`/`hi5_final.py` read the
   UDP feed directly, not this file.
-- No systemd service / autostart — everything's being run manually in a
-  terminal for now, on both the Pi and the Beelink.
+- **The Pi side does have systemd services** (this line used to say it
+  didn't): `flipdot-api.service` is enabled and running, `runkiosk.service`
+  exists but is currently stopped. Both are pointed at this repo by
+  `.d/override.conf` drop-ins — see "Starting the kiosk itself" in the
+  cheat sheet. The **Beelink side is still fully manual**: nothing
+  autostarts `leap_sender.py`, so a reboot there silently leaves the kiosk
+  blind, and that's the real remaining autostart gap.
 - See "Wired into the kiosk" above for the current integration's open ends.
   The hi-5 gesture gate is no longer among them — it's confirmed on real
   hardware at its shipped defaults; see "Hi-5 detection rebuilt on Leap

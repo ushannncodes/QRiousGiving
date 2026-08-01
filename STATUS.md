@@ -91,11 +91,19 @@ everything.
 
 ## Explicitly out of scope so far
 
-Production at `/home/pi/Desktop` (systemd services `runkiosk.service`,
-`flipdot-api.service`) is a **separate, older copy** of this code, still on
-v1's `cam_final.py`, and was crash-looping (`Picamera2()` IndexError — no Pi
-camera module found, since the hardware was swapped to the HuskyLens) before
-any of this work started. None of the above has been deployed there yet —
-that's a distinct step for whenever the v2 pipeline is fully verified on
-real hardware. Check `journalctl -u runkiosk.service` and
-`/etc/systemd/system/*.service` to re-orient if picking that up later.
+**Superseded 2026-08-01 — this section described a deployment gap that no
+longer exists.** It used to say production ran a separate, older copy at
+`/home/pi/Desktop` (still on v1's `cam_final.py`, crash-looping on a
+`Picamera2()` IndexError after the camera was swapped for the HuskyLens),
+with nothing here deployed to it.
+
+Both systemd services now run **this repo**, via `.d/override.conf`
+drop-ins: `runkiosk.service` → `/home/pi/QRiousGiving/kiosk/run_kiosk.py`,
+`flipdot-api.service` → `/home/pi/QRiousGiving/api/flipdot-api.py`. The
+stale `/home/pi/Desktop/*.py` copies still exist and are still what the
+*base* unit files name, so only the drop-ins keep production on the repo —
+if one is lost, the kiosk starts cleanly on year-old code. See "Starting
+the kiosk itself" in `LEAP_HANDOFF.md`.
+
+Note this whole file predates the Leap Motion switchover and describes the
+retired HuskyLens pipeline. `LEAP_HANDOFF.md` is the current doc.

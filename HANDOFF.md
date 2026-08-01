@@ -201,10 +201,17 @@ cam_v2.py (pose detection) + attract_v2.py (silhouette)
 - Service file: `/etc/systemd/system/runkiosk.service`
 - Override: `/etc/systemd/system/runkiosk.service.d/override.conf`
 - Points to: `/home/pi/QRiousGiving/kiosk/run_kiosk.py` (NOT the Desktop version)
-- Key env vars set in override:
-  - `FLIPDOT_SERIAL=/tmp/flipdot_vserial`
-  - `SERIAL_PORT=/tmp/flipdot_vserial`
+- Key env vars set in override (**updated 2026-08-01** — these now point at
+  the real panel, not the simulator vserial they were set to during
+  simulator bring-up):
+  - `SERIAL_PORT=/dev/ttyS0`
+  - `FLIPDOT_SERIAL=/dev/ttyS0`
   - `FLIPDOT_BAUD=57600`
+  - `DEBUG_LOG=1`
+- `flipdot-api.service` has its own drop-in, repointing it at
+  `/home/pi/QRiousGiving/api/flipdot-api.py` (run under `/home/pi/flipenv`)
+  and setting `ANIM_SCRIPT=/home/pi/QRiousGiving/animations/anim.py`. Its
+  `FLIPDOT_SERIAL=/dev/ttyS0` comes from the base unit, not the drop-in.
 
 ## Remaining issues
 
