@@ -1,0 +1,16 @@
+# Dependencies for leap_sender.py, which runs on the PC/Mac that has the
+# Leap Motion attached and Ultraleap's tracking service installed — NOT on
+# the Pi.
+#
+# This is NOT a simple `pip install -r` package — leap_sender.py needs
+# Ultraleap's official leapc-python-bindings, which must be cloned and
+# built against your local Gemini install. See the full steps in
+# leap_sender.py's module docstring, summarized here:
+#
+#   git clone https://github.com/ultraleap/leapc-python-bindings.git
+#   cd leapc-python-bindings
+#   python3 -m venv venv && source venv/bin/activate
+#   pip install -r requirements.txt
+#   pip install -e leapc-python-api
+#
+# Then run leap_sender.py using that same venv's python3.
