@@ -15,6 +15,13 @@ Landmark order (matches MediaPipe / HuskyLens ALGORITHM_HAND_RECOGNITION):
   13-16 ring    (MCP, PIP, DIP, TIP)
   17-20 pinky   (MCP, PIP, DIP, TIP)
 
+Each hand on the wire carries both `landmarks` (the 21 projected 2D points,
+used for rendering the hand shadow) and `pose` (Gemini's own hand-pose
+signals — grab_strength, per-digit is_extended, palm normal — used for
+gesture *recognition*, see hand_to_pose()). Consumers that only render
+(kiosk/attract_leap.py, leap/leap_flipdot_preview.py) can ignore `pose`
+entirely; it's additive and doesn't change the landmark schema.
+
 2D projection note:
   Which two of Leap's native (x, y, z) axes get sent as each landmark's
   2D [a, b] pair depends entirely on how the controller is physically
@@ -94,6 +101,81 @@ def _pt(vec):
     return [getattr(vec, _AXIS_A) * _SIGN_A, getattr(vec, _AXIS_B) * _SIGN_B]
 
 
+def _vec3(v):
+    """[x, y, z] from a Leap vector, or None if it isn't one."""
+    try:
+        return [float(v.x), float(v.y), float(v.z)]
+    except Exception:
+        return None
+
+
+_POSE_PROBE_DONE = False
+
+
+def _probe(obj, name):
+    """getattr that degrades to None instead of raising.
+
+    Which of Gemini's pose fields the LeapC Python bindings actually surface
+    varies between binding versions (some wrap the cffi struct with an
+    explicit property list, some pass everything through __getattr__). A
+    field we can't read must not kill the sender — the Pi treats None as
+    "this sub-test is unavailable, skip it".
+    """
+    try:
+        val = getattr(obj, name)
+    except Exception:
+        return None
+    return val
+
+
+def hand_to_pose(hand):
+    """Leap's own hand-pose signals, passed through raw for the Pi to threshold.
+
+    These come straight out of Gemini's tracking model, which already knows
+    whether the hand is open — `grab_strength` is 0.0 for a flat open hand
+    and 1.0 for a closed fist, which is exactly the open-palm/high-five test
+    kiosk/hi5_palm_debug.py needs. Far more reliable than re-deriving finger
+    extension from the 2D landmarks below, since PROJECT_AXES discards one
+    of the three axes and with it much of the finger-curl information.
+
+    Thresholding deliberately happens on the Pi, not here: this file has to
+    be hand-copied to the Beelink to take effect (see the module docstring),
+    so anything you might want to *tune* belongs on the machine you can
+    actually edit in place.
+    """
+    global _POSE_PROBE_DONE
+
+    palm = _probe(hand, "palm")
+    digits = [_probe(hand, n) for n in ("thumb", "index", "middle", "ring", "pinky")]
+    extended = [_probe(d, "is_extended") if d is not None else None for d in digits]
+    pose = {
+        # 0.0 = flat open hand, 1.0 = fist. The primary open-palm signal.
+        "grab": _probe(hand, "grab_strength"),
+        "pinch": _probe(hand, "pinch_strength"),
+        "grab_angle": _probe(hand, "grab_angle"),
+        # [thumb, index, middle, ring, pinky]; entries may be None
+        "extended": [None if e is None else bool(e) for e in extended],
+        "palm_normal": _vec3(_probe(palm, "normal")) if palm is not None else None,
+        "palm_dir": _vec3(_probe(palm, "direction")) if palm is not None else None,
+        "confidence": _probe(hand, "confidence"),
+    }
+    pose = {k: (float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v)
+            for k, v in pose.items()}
+
+    if not _POSE_PROBE_DONE:
+        _POSE_PROBE_DONE = True
+        got = [k for k, v in pose.items() if v is not None and v != [None] * 5]
+        missing = [k for k in pose if k not in got]
+        print(f"[leap_sender] pose fields available: {', '.join(got) or '(none!)'}")
+        if missing:
+            print(f"[leap_sender] pose fields NOT exposed by these bindings: {', '.join(missing)}")
+        if pose["grab"] is None:
+            print("[leap_sender] WARNING: grab_strength unavailable — the Pi's "
+                  "open-palm test will fall back to the is_extended count alone")
+
+    return pose
+
+
 def hand_to_landmarks(hand):
     lm = [None] * 21
     lm[0] = _pt(hand.arm.next_joint)  # wrist
@@ -135,21 +217,27 @@ class SenderListener(leap.Listener):
             return  # throttle to SEND_HZ
 
         hands = list(event.hands)
-        if not hands:
-            return
 
-        if PREFERRED_HAND in ("left", "right"):
+        if hands and PREFERRED_HAND in ("left", "right"):
             wanted = "HandType.Left" if PREFERRED_HAND == "left" else "HandType.Right"
             hands = [h for h in hands if str(h.type) == wanted]
-            if not hands:
-                return
 
+        # Keep sending when there are no hands, as {"hands": []}, rather than
+        # falling silent. Silence is ambiguous on the Pi — it can't tell "the
+        # hand left the tracking volume" from "the network hiccuped" or "the
+        # Beelink died", so it has to wait out a staleness timeout before
+        # believing the hand is gone, and during that wait it's still holding
+        # the last hand it saw. That let a yanked-away open palm keep driving
+        # the hi-5 fill for most of a second after it was physically gone
+        # (see kiosk/hi5_palm_debug.py). An explicit empty list is positive
+        # evidence of absence and lands within one frame.
         payload = {
             "ts": now,
             "hands": [
                 {
                     "hand_type": "left" if str(h.type) == "HandType.Left" else "right",
                     "landmarks": hand_to_landmarks(h),
+                    "pose": hand_to_pose(h),
                 }
                 for h in hands
             ],

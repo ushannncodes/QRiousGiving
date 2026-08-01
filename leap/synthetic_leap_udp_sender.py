@@ -15,14 +15,26 @@ exactly:
   "ts": <float unix time>,
   "hands": [
     {"hand_type": "left" | "right",
-     "landmarks": [[x_mm, z_mm], ...]}   # 21 points, wrist-first:
+     "landmarks": [[x_mm, z_mm], ...],    # 21 points, wrist-first:
                                           #   0 wrist
                                           #   1-4 thumb (CMC,MCP,IP,TIP)
                                           #   5-8/9-12/13-16/17-20
                                           #     index/middle/ring/pinky
                                           #     (MCP,PIP,DIP,TIP)
+     "pose": {...}}                       # Leap's own pose signals; see below
   ]
 }
+
+`hands` is an empty list while no hand is "in view" — the real sender sends
+these too rather than falling silent, so receivers get positive evidence of
+absence within a frame instead of waiting out a staleness timeout.
+
+The `pose` block mirrors what beelink/leap_sender.py extracts from Gemini,
+synthesised here from the same `curl` value that shapes the landmarks, so
+`grab` is 0.0 with the hand flat open and 1.0 with it fully curled. This is
+what kiosk/hi5_final.py's open-palm gate thresholds — a synthetic feed
+without it can't drive the hi-5 stage at all (that script exits rather than
+guessing from landmarks).
 
 Usage (in a terminal alongside the simulator, e.g. per the verification
 steps in LEAP_HANDOFF.md):
@@ -43,7 +55,12 @@ Env vars (all optional):
                   timer without the gesture flickering shut mid-hold.
                 "closed" — a held-still fist, for testing the "not open"
                   / idle-abort path.
+                "cycle" — no hand at all, then an open palm, repeating.
+                  Drives the whole kiosk FSM unattended: absence -> attract
+                  sees someone -> hi-5 fills -> hand withdrawn.
   SYNTH_HAND    "right" (default) or "left" — hand_type to send.
+  SYNTH_ABSENT_SEC / SYNTH_PRESENT_SEC   "cycle" mode phase lengths,
+                default 6.0 / 5.0 seconds.
 """
 
 import json
@@ -58,6 +75,8 @@ RPI_PORT   = int(os.getenv("RPI_PORT", "5111"))
 SEND_HZ    = float(os.getenv("SEND_HZ", "30"))
 SYNTH_MODE = os.getenv("SYNTH_MODE", "animate")
 SYNTH_HAND = os.getenv("SYNTH_HAND", "right")
+SYNTH_ABSENT_SEC  = float(os.getenv("SYNTH_ABSENT_SEC", "6.0"))
+SYNTH_PRESENT_SEC = float(os.getenv("SYNTH_PRESENT_SEC", "5.0"))
 
 # Same rough per-finger fan (degrees from straight up) and length (mm) as
 # leap/synthetic_hand_test.py, just re-targeted at the 21-point wrist-first
@@ -98,21 +117,30 @@ def _finger_chain(palm, angle_deg, length, curl):
     return [list(p) for p in pts]
 
 
+def _hand_present(t):
+    """False while "cycle" mode is between hands; always True otherwise."""
+    if SYNTH_MODE != "cycle":
+        return True
+    period = SYNTH_ABSENT_SEC + SYNTH_PRESENT_SEC
+    return (t % period) >= SYNTH_ABSENT_SEC
+
+
 def _hand_landmarks(t, mirror):
+    """Returns (landmarks, curl) — curl 0.0 = flat open, 1.0 = fully curled."""
     sign = -1.0 if mirror else 1.0
 
     if SYNTH_MODE == "animate":
         cx = sign * 70.0 + math.cos(t * 0.6) * 35.0
         cy = 190.0 + math.sin(t * 0.6) * 30.0
         curl = (math.sin(t * 1.3) + 1.0) / 2.0  # 0..1
-    elif SYNTH_MODE == "open":
+    elif SYNTH_MODE in ("open", "cycle"):
         cx, cy = sign * 70.0, 190.0
         curl = 0.0
     elif SYNTH_MODE == "closed":
         cx, cy = sign * 70.0, 190.0
         curl = 1.0
     else:
-        raise ValueError(f"SYNTH_MODE must be animate/open/closed, got {SYNTH_MODE!r}")
+        raise ValueError(f"SYNTH_MODE must be animate/open/closed/cycle, got {SYNTH_MODE!r}")
 
     palm = (cx, cy)
     wrist = (palm[0], palm[1] - WRIST_OFFSET)
@@ -121,7 +149,28 @@ def _hand_landmarks(t, mirror):
     for name, angle, length in FINGERS:
         a = angle * sign
         landmarks.extend(_finger_chain(palm, a, length, curl))
-    return landmarks
+    return landmarks, curl
+
+
+def _pose_from_curl(curl):
+    """Synthesise Gemini's pose signals from the curl driving the landmarks.
+
+    Deliberately crude — this exists so the hi-5 gate has something coherent
+    to threshold, not to model the real tracker. `grab` tracks curl directly
+    (Leap's own convention: 0.0 flat open, 1.0 fist) and fingers are called
+    extended below half curl. palm_normal is fixed facing the sensor, which
+    is the only orientation this 2D synthetic feed can meaningfully claim.
+    """
+    extended = curl < 0.5
+    return {
+        "grab": round(curl, 3),
+        "pinch": round(max(0.0, curl - 0.3) / 0.7, 3),
+        "grab_angle": round(curl * math.pi, 3),
+        "extended": [extended] * 5,
+        "palm_normal": [0.0, 0.0, -1.0],
+        "palm_dir": [0.0, -1.0, 0.0],
+        "confidence": 1.0,
+    }
 
 
 def main():
@@ -144,11 +193,14 @@ def main():
         loop_start = time.time()
         t = loop_start - t0
 
-        landmarks = _hand_landmarks(t, mirror=(SYNTH_HAND == "left"))
-        payload = {
-            "ts": loop_start,
-            "hands": [{"hand_type": SYNTH_HAND, "landmarks": landmarks}],
-        }
+        if _hand_present(t):
+            landmarks, curl = _hand_landmarks(t, mirror=(SYNTH_HAND == "left"))
+            hands = [{"hand_type": SYNTH_HAND,
+                      "landmarks": landmarks,
+                      "pose": _pose_from_curl(curl)}]
+        else:
+            hands = []  # keep sending; absence is data, not silence
+        payload = {"ts": loop_start, "hands": hands}
         sock.sendto(json.dumps(payload).encode("utf-8"), (RPI_HOST, RPI_PORT))
         time.sleep(max(0, interval - (time.time() - loop_start)))
 

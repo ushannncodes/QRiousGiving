@@ -9,28 +9,45 @@ Adds:
 
 Common env:
   WHITE_VAL ("1"), FLIPDOT_SERIAL ("/dev/ttyS0"), FLIPDOT_BAUD ("57600")
-  HOLD_REQUIRED_SEC ("2.0"), MISS_GRACE_SEC ("0.8")
+  HOLD_REQUIRED_SEC ("1.5")
+  MISS_GRACE_SEC ("0.35") — bridges a brief tracking dropout mid-hold; must
+    stay well below HOLD_REQUIRED_SEC (see the note at its definition)
   NEXT_SCRIPT (default: qr_works.py next to this script)
   SCROLL_STEP ("1"), SCROLL_DELAY ("0.1"), FONT_SPACING ("1")
   BIG_HI_PAUSE ("1.2"), TUI ("0")
 
-Palm detection — landmarks come from a Leap Motion Controller (a Beelink
+Palm detection — hand data comes from a Leap Motion Controller (a Beelink
 Windows PC runs the actual sensor + Ultraleap tracking and streams UDP to
 this Pi; see LEAP_HANDOFF.md), not the HuskyLens or the original
-Picamera2 + MediaPipe Hands setup (see STATUS.md for that history). The
-Leap feed's wire schema uses the same 21-point wrist-first landmark
-layout MediaPipe/HuskyLens used, so the open-palm geometry below is
-unchanged, just fed Leap landmarks instead. Landmarks are real-world
-millimeters now, not HuskyLens's raw sensor pixels, so DIST_MARGIN/
-MIN_HAND_AREA are almost certainly wrong at their old pixel-tuned
-defaults — expect to retune both against real hardware before trusting
-them:
-  ANGLE_PIP_THRESH_DEG ("130"), ANGLE_DIP_THRESH_DEG ("118"), DIST_MARGIN ("3")
-  RELAX_TWO_FINGERS ("1")
+Picamera2 + MediaPipe Hands setup (see STATUS.md for that history).
+
+The open-palm test thresholds Leap's own pose signals — Gemini already
+knows whether the hand is open, so there's nothing to re-derive. Chiefly
+`grab` (0.0 = flat open hand, 1.0 = closed fist), plus per-digit
+is_extended and pinch strength. This replaced a landmark-geometry test
+with a bbox-area fallback that fired for *any* hand in view; see the
+comment above is_open_palm() for why both were unfixable on a Leap feed,
+and kiosk/hi5_palm_debug.py for a no-intro harness for tuning these:
+  MAX_GRAB_STRENGTH ("0.20")    — above this = too closed
+  MAX_PINCH_STRENGTH ("0.40")   — above this = pinching, not a flat palm
+  MIN_EXTENDED_FINGERS ("4")    — of 5; 4 tolerates a tucked thumb
+  MIN_CONFIDENCE ("0.0")        — Leap's own tracking confidence
+  PALM_FACING_AXIS ("")         — off by default; set to a Leap axis
+    ("y", "-y", "z", …) to also require the palm to face that way. Mount-
+    dependent, so tune it by watching hi5_palm_debug.py's palm_n= values.
+  PALM_FACING_MIN_DOT ("0.5")   — how strictly, once the axis is set
+
+REQUIRES a leap_sender.py new enough to send the "pose" block. The Beelink
+runs a hand-copied sender, so if hands arrive without one this exits back
+to the kiosk after NO_POSE_GRACE_SEC rather than silently reverting to
+"any hand counts".
 
 Leap Motion feed:
   LISTEN_PORT ("5111")     — UDP port, must match beelink/leap_sender.py's RPI_PORT
-  UDP_STALE_SEC ("0.5")    — treat the hand as gone if no packet arrives within this window
+  UDP_STALE_SEC ("0.5")    — no packets at all for this long means the sender
+                             or network is down; a hand *leaving* arrives as an
+                             explicit empty-hands packet instead
+  NO_POSE_GRACE_SEC ("5.0")
 
 Timing / smoothing:
   LOOP_SLEEP_SEC ("0.03")
@@ -39,10 +56,6 @@ Timing / smoothing:
 Presence logic (NEW):
   ASSUME_OPEN_SEC ("5.0")     # presence ≥ this → treat as open palm
   IDLE_ABORT_SEC ("5.0")      # no presence ≥ this → exit to kiosk
-
-Fallbacks:
-  FALLBACK_BBOX ("1")
-  MIN_HAND_AREA ("5000")      # pixel-area of the landmark bbox, not a fraction
 
 Palm asset:
   PALM_JSON (default: assets/palm_combo.json relative to this script)
@@ -134,7 +147,7 @@ except Exception:
 
 
 
-import os, sys, time, math, json, subprocess
+import os, sys, time, json, subprocess
 
 # Force line-buffering (or fully unbuffered) for immediate logs
 try:
@@ -160,7 +173,11 @@ BAUD_RATE   = int(os.getenv("FLIPDOT_BAUD", "57600"))
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 HOLD_REQUIRED_SEC = float(os.getenv("HOLD_REQUIRED_SEC", "1.5"))
-MISS_GRACE_SEC    = float(os.getenv("MISS_GRACE_SEC", "1.5"))
+# Bridges a brief tracking dropout mid-hold. Must stay well BELOW
+# HOLD_REQUIRED_SEC: it keeps the fill counting after the last open frame, so
+# at the old 1.5s (== the hold) a single detected frame completed the whole
+# gesture on its own.
+MISS_GRACE_SEC    = float(os.getenv("MISS_GRACE_SEC", "0.35"))
 NEXT_SCRIPT       = os.getenv("NEXT_SCRIPT", os.path.join(SCRIPT_DIR, "qr_works.py"))
 
 MESSAGES = ["HI","I AM A FUTURE DONATION MACHINE","TO LEARN MORE","HI-5"]
@@ -169,15 +186,22 @@ SCROLL_DELAY     = float(os.getenv("SCROLL_DELAY", "0.1"))
 BIG_HI_PAUSE     = float(os.getenv("BIG_HI_PAUSE", "1.2"))
 TUI              = os.getenv("TUI", "0") == "1"
 
-# Palm gate
-ANGLE_PIP_THRESH_DEG = float(os.getenv("ANGLE_PIP_THRESH_DEG", "130"))
-ANGLE_DIP_THRESH_DEG = float(os.getenv("ANGLE_DIP_THRESH_DEG", "118"))
-DIST_MARGIN          = float(os.getenv("DIST_MARGIN", "3"))  # pixels, not 0..1 fraction
-RELAX_TWO_FINGERS    = os.getenv("RELAX_TWO_FINGERS", "1") == "1"
+# Palm gate — thresholds on Leap's own pose signals (see is_open_palm below)
+MAX_GRAB_STRENGTH    = float(os.getenv("MAX_GRAB_STRENGTH", "0.20"))
+MAX_PINCH_STRENGTH   = float(os.getenv("MAX_PINCH_STRENGTH", "0.40"))
+MIN_EXTENDED_FINGERS = int(os.getenv("MIN_EXTENDED_FINGERS", "4"))
+MIN_CONFIDENCE       = float(os.getenv("MIN_CONFIDENCE", "0.0"))
+PALM_FACING_AXIS     = os.getenv("PALM_FACING_AXIS", "").strip()
+PALM_FACING_MIN_DOT  = float(os.getenv("PALM_FACING_MIN_DOT", "0.5"))
 
 # Leap Motion UDP feed
 LISTEN_PORT   = int(os.getenv("LISTEN_PORT", "5111"))
 UDP_STALE_SEC = float(os.getenv("UDP_STALE_SEC", "0.5"))
+# How long to tolerate hands arriving with no "pose" block (an old
+# leap_sender.py still running on the Beelink) before giving up and exiting
+# back to the kiosk. Not fatal-with-error: run_kiosk.py would just relaunch
+# us into the same wall, so a clean exit lets the FSM move on.
+NO_POSE_GRACE_SEC = float(os.getenv("NO_POSE_GRACE_SEC", "5.0"))
 
 # Timing / smoothing
 LOOP_SLEEP_SEC   = float(os.getenv("LOOP_SLEEP_SEC", "0.03"))
@@ -187,10 +211,6 @@ HYST_THRESH      = float(os.getenv("HYST_THRESH", "0.5"))#tighten this to a high
 # Presence
 ASSUME_OPEN_SEC  = float(os.getenv("ASSUME_OPEN_SEC", "5.0"))
 IDLE_ABORT_SEC   = float(os.getenv("IDLE_ABORT_SEC", "30"))
-
-# Fallbacks
-FALLBACK_BBOX     = os.getenv("FALLBACK_BBOX", "1") == "1"
-MIN_HAND_AREA     = float(os.getenv("MIN_HAND_AREA", "5000"))  # pixel area, not a fraction
 
 PALM_JSON         = os.getenv("PALM_JSON", os.path.join(SCRIPT_DIR, "..", "assets", "palm_combo.json"))
 
@@ -413,57 +433,91 @@ def tui_print_preview(detected: bool, progress: float, presence: bool):
     print(f"\nHold progress: [{'='*n}{' '*(width-n)}]  {progress*100:4.0f}%")
 
 # ============== Hand + Presence helpers ==============
-class _LM:
-    """Minimal MediaPipe-landmark-shaped (.x/.y) point, fed from whichever
-    21-point landmark source is wired in (currently Leap Motion over UDP)
-    so is_open_palm() etc. don't need to change."""
-    __slots__ = ("x", "y")
-    def __init__(self, x, y):
-        self.x = x
-        self.y = y
+# Open-palm detection uses the pose signals Leap's Gemini tracking model
+# already computes (grab_strength, per-digit is_extended, palm normal),
+# shipped in the UDP payload's "pose" block by beelink/leap_sender.py.
+#
+# It used to re-derive finger extension from the 21 2D landmarks, with a
+# bounding-box-area fallback. Both are wrong on a Leap feed: the landmarks
+# are a 2D projection (PROJECT_AXES drops one of Leap's three axes, taking
+# most of the finger-curl information with it), and the bbox fallback's
+# MIN_HAND_AREA was tuned in HuskyLens sensor *pixels* while Leap landmarks
+# are *millimetres* — 5000 became a ~70x70mm box, smaller than a fist, so it
+# fired for any hand in view regardless of shape and the fill ran to 100%
+# whatever you did. Don't reintroduce either; threshold pose.grab.
+# See LEAP_HANDOFF.md, and kiosk/hi5_palm_debug.py for the tuning harness.
+
+_AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
+_warned = set()
 
 
-def _dist(a, b): return math.hypot(a.x - b.x, a.y - b.y)
+def _warn_once(key: str, msg: str):
+    if key not in _warned:
+        _warned.add(key)
+        _log(f"[HI5] {msg}")
 
-def _angle_deg(a, b, c):
-    bax = a.x - b.x; bay = a.y - b.y
-    bcx = c.x - b.x; bcy = c.y - b.y
-    num = bax*bcx + bay*bcy
-    den = math.hypot(bax, bay) * math.hypot(bcx, bcy) + 1e-9
-    val = max(-1.0, min(1.0, num/den))
-    return math.degrees(math.acos(val))
 
-def _extended_finger(lm, mcp_i, pip_i, dip_i, tip_i) -> bool:
-    wrist = lm[0]
-    mcp, pip, dip, tip = lm[mcp_i], lm[pip_i], lm[dip_i], lm[tip_i]
-    dist_ok = _dist(tip, wrist) > _dist(pip, wrist) + DIST_MARGIN
-    ang_pip = _angle_deg(mcp, pip, dip)
-    ang_dip = _angle_deg(pip, dip, tip)
-    angle_ok = (ang_pip >= ANGLE_PIP_THRESH_DEG) and (ang_dip >= ANGLE_DIP_THRESH_DEG)
-    return dist_ok and angle_ok
+def _parse_facing_axis(spec: str):
+    if not spec:
+        return None
+    sign = -1.0 if spec.startswith("-") else 1.0
+    axis = spec.lstrip("-").lower()
+    if axis not in _AXIS_INDEX:
+        fatal(f"ERROR: PALM_FACING_AXIS={spec!r} — expected x, y or z, optionally '-'-prefixed")
+    return _AXIS_INDEX[axis], sign
 
-def _extended_thumb(lm) -> bool:
-    wrist = lm[0]
-    mcp, ip, tip = lm[2], lm[3], lm[4]
-    dist_ok = _dist(tip, wrist) > _dist(ip, wrist) + (DIST_MARGIN * 0.6)
-    ang_ip = _angle_deg(mcp, ip, tip)
-    return dist_ok and (ang_ip >= (ANGLE_PIP_THRESH_DEG - 10))
 
-def is_open_palm(lm) -> bool:
-    idx = _extended_finger(lm, 5, 6, 7, 8)
-    mid = _extended_finger(lm, 9, 10, 11, 12)
-    rng = _extended_finger(lm, 13, 14, 15, 16)
-    pky = _extended_finger(lm, 17, 18, 19, 20)
-    ext_count = sum([idx, mid, rng, pky])
-    if ext_count >= 3: return True
-    if RELAX_TWO_FINGERS and ext_count >= 2: return True
-    if ext_count >= 2 and _extended_thumb(lm): return True
-    return False
+_FACING = _parse_facing_axis(PALM_FACING_AXIS)
 
-def _bbox_area_norm(lm):
-    xs = [p.x for p in lm]; ys = [p.y for p in lm]
-    w = max(xs) - min(xs); h = max(ys) - min(ys)
-    return w * h
+
+def _num(pose, key):
+    v = pose.get(key)
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def is_open_palm(pose: dict):
+    """True if `pose` looks like a flat, open, forward-facing hand.
+
+    Sub-tests whose field the sender couldn't read (value None) are skipped
+    with a one-time warning, so older LeapC bindings degrade to a looser test
+    rather than failing shut. Returns (bool, reason) — reason names the first
+    failing gate, which is what makes the debug log useful for tuning.
+    """
+    grab = _num(pose, "grab")
+    if grab is None:
+        _warn_once("grab", "sender exposed no grab_strength — skipping the primary open-hand gate")
+    elif grab > MAX_GRAB_STRENGTH:
+        return False, f"too_closed(grab={grab:.2f}>{MAX_GRAB_STRENGTH:.2f})"
+
+    pinch = _num(pose, "pinch")
+    if pinch is not None and pinch > MAX_PINCH_STRENGTH:
+        return False, f"pinching(pinch={pinch:.2f})"
+
+    extended = pose.get("extended")
+    if isinstance(extended, list) and any(e is not None for e in extended):
+        n_ext = sum(1 for e in extended if e)
+        if n_ext < MIN_EXTENDED_FINGERS:
+            return False, f"few_fingers({n_ext}<{MIN_EXTENDED_FINGERS})"
+    else:
+        _warn_once("extended", "sender exposed no is_extended flags — skipping the finger-count gate")
+
+    conf = _num(pose, "confidence")
+    if conf is not None and MIN_CONFIDENCE > 0.0 and conf < MIN_CONFIDENCE:
+        return False, f"low_confidence({conf:.2f})"
+
+    if _FACING is not None:
+        normal = pose.get("palm_normal")
+        if isinstance(normal, list) and len(normal) == 3:
+            idx, sign = _FACING
+            mag = sum(c * c for c in normal) ** 0.5 or 1.0
+            dot = (normal[idx] * sign) / mag
+            if dot < PALM_FACING_MIN_DOT:
+                return False, f"palm_turned(dot={dot:.2f}<{PALM_FACING_MIN_DOT:.2f})"
+        else:
+            _warn_once("normal", "sender exposed no palm normal — skipping the facing gate")
+
+    return True, "open_palm"
+
 
 def _now_ms():
     return int(time.time() * 1000)
@@ -508,18 +562,21 @@ def main():
 
     _sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
     _sock.bind(("0.0.0.0", LISTEN_PORT))
-    _sock.settimeout(0.05)
+    _sock.setblocking(False)  # drained each pass; LOOP_SLEEP_SEC paces the loop
     _log(f"[HI5] UDP listener on :{LISTEN_PORT}")
 
     hold_start = None
     satisfied = False
     last_seen_time = 0.0
+    last_open_seen_time = 0.0
     last_presence_time = time.time()
     presence_run_start = None
     absence_run_start  = time.time()
     smoothed_hit = 0.0
     last_hands = None
-    last_hand_seen_udp_t = 0.0
+    last_packet_t = 0.0
+    first_poseless_t = None
+    seen_pose_ever = False
 
     # logging state (NEW)
     last_log_ms = _now_ms()
@@ -527,36 +584,77 @@ def main():
     last_progress_pct = -1
 
     while True:
-        try:
-            data, _addr = _sock.recvfrom(8192)
-            payload = json.loads(data.decode("utf-8"))
-            last_hands = payload.get("hands")
-            if last_hands:
-                last_hand_seen_udp_t = time.time()
-        except _socket.timeout:
-            pass
-        except (OSError, json.JSONDecodeError) as e:
-            _log(f"[HI5] UDP read error: {e}")
+        # Drain the socket every pass: act on the newest packet only, and never
+        # let a backlog turn into growing latency.
+        got_packet = False
+        while True:
+            try:
+                data, _addr = _sock.recvfrom(8192)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError as e:
+                _log(f"[HI5] UDP read error: {e}")
+                break
+            try:
+                payload = json.loads(data.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                _log(f"[HI5] bad packet: {e}")
+                continue
+            last_hands = payload.get("hands") or []
+            got_packet = True
 
+        now = time.time()
+        if got_packet:
+            last_packet_t = now
+
+        # A pose is evidence of an open palm only for the packet it arrived in.
+        # Re-evaluating the last-received pose on every loop pass (which is what
+        # this used to do) meant a hand that had already left kept "detecting"
+        # as open until the staleness timeout expired, stacking an extra
+        # ~UDP_STALE_SEC of fill on top of MISS_GRACE_SEC — enough that showing
+        # a palm briefly and yanking it away still filled to 100%. Bridging
+        # dropouts is MISS_GRACE_SEC's job, and it alone.
         open_palm_now = False
-        hand_present_now = bool(last_hands) and (time.time() - last_hand_seen_udp_t) <= UDP_STALE_SEC
-        reason = "idle"
+        hand_present_now = bool(got_packet and last_hands)
+        hand_gone = False
+        if hand_present_now:
+            reason = "hand"                          # refined by is_open_palm below
+        elif got_packet:
+            reason, hand_gone = "hand_gone", True    # explicit {"hands": []}
+        elif (now - last_packet_t) > UDP_STALE_SEC:
+            reason, hand_gone = "feed_stale", True   # sender/network down
+        else:
+            reason = "between_packets"               # normal at 30Hz, not absence
+
+        if hand_gone:
+            # Positive evidence of absence, not a dropout — cancel the grace
+            # window outright instead of letting it coast.
+            last_open_seen_time = 0.0
+            smoothed_hit = 0.0
 
         if hand_present_now:
-            hand = last_hands[0]  # first/preferred hand only (MAX_HANDS=1 equivalent)
-            lm = [_LM(x, y) for x, y in hand["landmarks"]]
-            # Primary: palm geometry
-            if is_open_palm(lm):
-                open_palm_now = True
-                reason = "palm_geom"
-            # Fallback: bbox area
-            elif FALLBACK_BBOX and _bbox_area_norm(lm) >= MIN_HAND_AREA:
-                open_palm_now = True
-                reason = "bbox_fallback"
+            pose = last_hands[0].get("pose")  # first/preferred hand only
+            if isinstance(pose, dict):
+                seen_pose_ever = True
+                open_palm_now, reason = is_open_palm(pose)
+            else:
+                # Old leap_sender.py on the Beelink. Refuse to guess from the
+                # landmarks — guessing is what made this fire on any hand at all.
+                reason = "no_pose_in_payload"
+                if first_poseless_t is None:
+                    first_poseless_t = now
+                elif not seen_pose_ever and (now - first_poseless_t) >= NO_POSE_GRACE_SEC:
+                    _log("[HI5] ABORT: hands arriving with no 'pose' block — the Beelink "
+                         "is running an old leap_sender.py (see LEAP_HANDOFF.md). "
+                         "Exiting to kiosk.")
+                    maybe_close_serial()
+                    sys.exit(0)
 
         # ---- Presence decision
-        presence_now = hand_present_now
-        now = time.time()
+        # Presence must survive the gaps between packets (unlike open-palm
+        # detection above, which must not), so it keys off packet recency
+        # rather than "did a packet land on this exact pass".
+        presence_now = bool(last_hands) and (now - last_packet_t) <= UDP_STALE_SEC
 
         PRESENCE_GRACE_SEC = float(os.getenv("PRESENCE_GRACE_SEC", "0.8"))
         if presence_now:
@@ -597,10 +695,15 @@ def main():
 
         if hand_present_now:
             last_seen_time = now
+        if open_palm_now:
+            last_open_seen_time = now
 
-        # Smooth + grace
+        # Smooth + grace. Grace is keyed off last_open_seen_time, not
+        # last_seen_time — it exists to bridge a brief tracking dropout
+        # while the hand stays open, not to keep counting while a
+        # present-but-different hand shape (e.g. a peace sign) is in view.
         smoothed_hit = (1.0 - HYST_ALPHA) * smoothed_hit + HYST_ALPHA * (1.0 if open_palm_now else 0.0)
-        effective_open = (smoothed_hit > HYST_THRESH) or ((now - last_seen_time) <= MISS_GRACE_SEC)
+        effective_open = (smoothed_hit > HYST_THRESH) or ((now - last_open_seen_time) <= MISS_GRACE_SEC)
 
         # ---- Throttled debug log (NEW)
         if DEBUG_LOG:

@@ -109,8 +109,57 @@ while moving a hand around; see "Full relaunch cheat sheet" below.
 
 UDP packet (Beelink → Pi), JSON:
 ```json
-{"ts": 1752221845.0, "hand_type": "right", "landmarks": [[x, y], ...]}
+{"ts": 1752221845.0, "hands": [
+  {"hand_type": "right",
+   "landmarks": [[x, y], ...],
+   "pose": {"grab": 0.02, "pinch": 0.05, "grab_angle": 0.31,
+            "extended": [true, true, true, true, true],
+            "palm_normal": [x, y, z], "palm_dir": [x, y, z],
+            "confidence": 1.0}}
+]}
 ```
+
+### Empty-hands heartbeat (added 2026-08-01)
+
+The sender now transmits `{"hands": []}` when the tracking volume is empty,
+instead of falling silent as it used to. Silence is ambiguous on the Pi —
+it can't distinguish "the hand left" from "the network hiccuped" or "the
+Beelink died" — so a receiver had to wait out a staleness timeout while
+still holding the last hand it saw. An explicit empty list is positive
+evidence of absence and lands within one frame.
+
+Consumers must therefore treat `hands` as *possibly present but empty*, not
+just present/absent. `bool(payload.get("hands"))` is the right test and is
+already what `attract_leap.py` and `hi5_palm_debug.py` use, so this was
+backward-compatible for them; new consumers should follow suit. A staleness
+timeout is still needed, but now genuinely means "the feed is down".
+
+### `pose` — Gemini's own hand-pose signals (added 2026-08-01)
+
+`landmarks` is for *rendering*; `pose` is for *gesture recognition*. Any
+field the installed LeapC bindings don't expose arrives as `null` rather
+than being omitted, and `leap_sender.py` prints which ones resolved on the
+first tracked hand.
+
+`grab` is the important one: **0.0 = flat open hand, 1.0 = closed fist**.
+It's what `kiosk/hi5_palm_debug.py` now uses as its primary open-palm test.
+
+Why this exists: the old open-palm test re-derived finger extension from
+the 2D `landmarks`, with a bounding-box-area fallback. Both are wrong on a
+Leap feed — `PROJECT_AXES` discards an axis (taking most of the finger-curl
+information with it), and the fallback's `MIN_HAND_AREA=5000` was tuned in
+HuskyLens sensor *pixels* while Leap landmarks are *millimetres*, so 5000
+became ≈ a 70×70mm box, smaller than a fist. Result: the hi-5 fill
+triggered on any hand in view regardless of shape. Don't reintroduce a
+landmark-geometry or bbox-area open-palm test; threshold `pose.grab`.
+
+`pose` is purely additive — render-only consumers (`kiosk/attract_leap.py`,
+`leap/leap_flipdot_preview.py`, `leap_visualizer.py`) ignore it and are
+unaffected. But **`kiosk/hi5_palm_debug.py` requires it**, and the Beelink
+runs a hand-copied sender, so that script exits with instructions if
+packets arrive without a `pose` block. `kiosk/hi5_final.py` still uses the
+old landmark/bbox test and still has the over-triggering bug — port the
+`pose` logic across once the thresholds are tuned on hardware.
 
 ## Files (all in this repo's working folder, none touch existing kiosk code)
 
@@ -318,6 +367,52 @@ the schema match first — it currently doesn't.
   `IDLE_ABORT_SEC` can never actually fire. Affects both sensor backends
   identically; out of scope for the Leap integration, flagged here for
   whoever picks it up next.
+
+## Hi-5 detection rebuilt on Leap pose signals (2026-08-01)
+
+The hi-5 gesture used to fill to 100% for essentially any hand in view, and
+kept filling for ~0.85s after the hand was pulled away. Three causes, all
+fixed:
+
+1. **The bbox fallback fired for every hand.** `MIN_HAND_AREA=5000` was
+   tuned in HuskyLens sensor pixels; Leap landmarks are millimetres, so it
+   meant "bigger than ~70×70mm" — smaller than a fist. It bypassed the palm
+   test entirely. Removed, along with the landmark-geometry test it fell
+   back from (a 2D projection can't see finger curl reliably).
+2. **`MISS_GRACE_SEC` equalled `HOLD_REQUIRED_SEC`** (both 1.5s), so a
+   single detected frame kept the fill counting for the entire hold. Now
+   0.35s, with a startup warning if it's ever set ≥ the hold again.
+3. **A stale pose was re-detected every loop pass.** The Pi held the last
+   hand it saw and re-evaluated that frozen pose for `UDP_STALE_SEC` after
+   the hand left, *then* started the grace window. A pose now counts only
+   on the packet it arrived in, and the sender's new empty-hands heartbeat
+   cancels the grace outright.
+
+Detection is now `pose.grab` + `is_extended` + `pinch` (see the schema
+section above). `kiosk/hi5_palm_debug.py` is the tuning harness — same
+detection code, no intro text, loops back on success instead of chaining
+to the QR script.
+
+**Verified 2026-08-01**, both stages and the full FSM, driven by
+`leap/synthetic_leap_udp_sender.py` (now sends `pose` blocks, plus a new
+`SYNTH_MODE=cycle` that alternates absence/open-palm to drive the whole
+kiosk unattended). Panel output went to a pty, so this is *not* yet
+confirmed against the real flipdot panel or a real hand:
+
+| Case | Result |
+|---|---|
+| Open palm held past the hold | fills, chains to `qr_works.py` |
+| Palm held 0.7s of 1.5s then withdrawn | stops at ~38%, no trigger |
+| Closed fist held 2.4s | 0%, never triggers |
+| Hands with no `pose` block | logs ABORT, exits cleanly to the kiosk |
+| Full FSM: attract → trigger → hi-5 → QR | all milestones hit |
+
+Still to do: **tune `MAX_GRAB_STRENGTH` (0.20) against a real hand** — the
+synthetic feed reports a perfect 0.0, which proves the plumbing but tells
+you nothing about where a real relaxed-but-open hand sits. Optionally set
+`PALM_FACING_AXIS` afterwards to require a palm actually facing the panel
+rather than held edge-on; it's mount-dependent, so read it off
+`hi5_palm_debug.py`'s logged `palm_n=` values.
 
 ## Not yet done / open ends
 
