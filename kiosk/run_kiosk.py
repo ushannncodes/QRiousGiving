@@ -15,12 +15,14 @@ HI5_SCRIPT     = os.getenv("HI5_SCRIPT",     os.path.join(SCRIPT_DIR, "hi5_final
 ATTRACT_SCRIPT = os.getenv("ATTRACT_SCRIPT", os.path.join(SCRIPT_DIR, "attract_leap.py"))
 
 CAM_SIGNAL_PATH     = os.getenv("CAM_SIGNAL_PATH", "/tmp/cam_state.json")
-# Tuned for HuskyLens's room-scale approach detection (someone walking up
-# from across the room). attract_leap.py's Leap Motion feed only sees a
-# hand once it's already within ~10-40cm of the panel, so this multi-second
-# warmup/hold window will likely feel sluggish for that near-field
-# presence — retune live against real hardware rather than guessing here.
-TRIGGER_HOLD_SEC    = float(os.getenv("TRIGGER_HOLD_SEC", "10.0"))   # presence to promote -> HI5
+# Was 10.0s, sized for HuskyLens's room-scale approach detection (someone
+# walking up from across the room). attract_leap.py's Leap Motion feed only
+# sees a hand once it's already within ~10-40cm of the panel, so that window
+# was sluggish for near-field presence; halved to 5.0s. Note the timer resets
+# on any dropout, and attract_leap drops `active` after STALE_SEC (1.0s)
+# without a hand — so this is 5s of *uninterrupted* tracking. Still a desk
+# guess, not a verified-on-hardware number; confirm it feels right live.
+TRIGGER_HOLD_SEC    = float(os.getenv("TRIGGER_HOLD_SEC", "5.0"))   # presence to promote -> HI5
 
 ACTIVE_STALE_SEC    = float(os.getenv("ACTIVE_STALE_SEC", "2.0"))   # heartbeat freshness from cam
 API_STATUS_URL      = os.getenv("API_STATUS_URL", "http://127.0.0.1:8080/status")
@@ -38,9 +40,39 @@ POLL_SLEEP_KIOSK    = float(os.getenv("POLL_SLEEP_CAM", "0.05"))
 POLL_SLEEP_WAIT     = float(os.getenv("POLL_SLEEP_WAIT", "0.10"))
 WAIT_LOG_EVERY      = float(os.getenv("WAIT_LOG_EVERY", "0.5"))
 
-# NEW: HI-5 idle timeout + progress logging
-HI5_IDLE_TIMEOUT_SEC = float(os.getenv("HI5_IDLE_TIMEOUT_SEC", "120.0"))
+# HI-5 idle timeout + progress logging. This is the outer cap on the whole
+# hi-5 stage — how long someone can stand there without completing the palm
+# hold before we give up on them. Was 120s, now 100s: two minutes of "HI" on
+# the panel is a long time to park the kiosk on a stage nobody is finishing.
+#
+# Don't cut this much further without shortening the intro first. hi5_final.py
+# scrolls ~38s of intro text before palm detection even starts, and that time
+# comes out of this budget — at 100s a visitor gets ~62s of actual interaction,
+# but at 60s it's only ~22s, which is tight enough to feel broken. See
+# LEAP_HANDOFF.md; SCROLL_DELAY is the knob that shortens the intro.
+#
+# Distinct from (and much longer than) hi5_final.py's own IDLE_ABORT_SEC (30s),
+# which fires when there's no hand in the feed at all — whichever trips first
+# ends the stage. Deliberately NOT the same as SCAN_GRACE_SEC (still 120s):
+# that one is the post-QR scan window, where a real visitor is actually
+# reading the code off the panel and needs the time.
+HI5_IDLE_TIMEOUT_SEC = float(os.getenv("HI5_IDLE_TIMEOUT_SEC", "100.0"))
 HI5_IDLE_LOG_EVERY   = float(os.getenv("HI5_IDLE_LOG_EVERY", "0.5"))
+
+# hi5_final.py's "I gave up; nobody was ever here" exit code (its
+# EXIT_IDLE_ABORT). SCAN_GRACE_SEC exists to give a real visitor time to scan
+# the QR, so on this code we skip it: there was no visitor and no QR, and
+# holding the panel for two more minutes just parks a dead stage's last frame
+# in front of the next person walking up. Plain exit 0 = ran to completion
+# (the success path chains into qr_works.py) and still gets the full grace.
+HI5_EXIT_IDLE_ABORT  = int(os.getenv("HI5_EXIT_IDLE_ABORT", "3"))
+
+# hi5_final.py touches this the instant the palm hold completes. Past that
+# point it's no longer an idle hi-5 stage — it's the "SCAN ME" card and
+# qr_works.py drawing the QR — so HI5_IDLE_TIMEOUT_SEC must stop applying,
+# or a hold finished just under the cap gets its QR killed a second later.
+# Deleted before every spawn below, so a stale file can't disarm the cap.
+HI5_COMMIT_PATH      = os.getenv("HI5_COMMIT_PATH", "/tmp/hi5_committed")
 
 # ---------- helpers ----------
 def _spawn_py(path):
@@ -121,6 +153,19 @@ def _ensure_hi5_stopped(hi5_proc):
     # cheap insurance, not because the original race is still possible.
     _wait_for_pattern_gone(r"/hi5_final\.py")
     return None
+
+def _clear_hi5_commit():
+    # Disarm before each spawn so a leftover marker from a previous visitor
+    # can't switch off the idle cap for the next one.
+    try:
+        os.remove(HI5_COMMIT_PATH)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+def _hi5_committed():
+    return os.path.exists(HI5_COMMIT_PATH)
 
 def _read_cam_state():
     # cam writes {"active": bool, "delta_ema": float, "ts": unix}
@@ -213,6 +258,7 @@ def main():
                         t_kill  = time.time()
                         attract = _ensure_attract_stopped(attract)
                         print(f"[KIOSK] attract stop done in {time.time()-t_kill:.3f}s → spawning HI5…")
+                        _clear_hi5_commit()
                         t_spawn = time.time()
                         hi5 = _spawn_py(HI5_SCRIPT)
                         print(f"[KIOSK] spawned HI5 pid={hi5.pid} in {time.time()-t_spawn:.3f}s")
@@ -256,18 +302,25 @@ def main():
                     time.sleep(POLL_SLEEP_WAIT)
                     continue
 
+            # Once the palm hold lands, HI5 is the QR flow, not an idle stage —
+            # stop counting against it (see HI5_COMMIT_PATH).
+            committed = _hi5_committed()
+
             # ---- Progress log: show how much of the idle window has elapsed ----
             now = time.time()
             if hi5_t0 and (now - hi5_last_log_t) >= HI5_IDLE_LOG_EVERY:
-                elapsed   = now - hi5_t0
-                remaining = max(0.0, HI5_IDLE_TIMEOUT_SEC - elapsed)
-                msg = (f"[HI5] idle  {elapsed:6.1f}/{HI5_IDLE_TIMEOUT_SEC:6.1f}s "
-                       f"(remaining {remaining:5.1f}s)")
+                if committed:
+                    msg = "[HI5] committed → QR flow running; idle cap suspended"
+                else:
+                    elapsed   = now - hi5_t0
+                    remaining = max(0.0, HI5_IDLE_TIMEOUT_SEC - elapsed)
+                    msg = (f"[HI5] idle  {elapsed:6.1f}/{HI5_IDLE_TIMEOUT_SEC:6.1f}s "
+                           f"(remaining {remaining:5.1f}s)")
                 _log_line(msg)  # TTY-safe single-line updater
                 hi5_last_log_t = now
 
             # ---- Idle timeout: return to RUN_KIOSK if no interaction ----
-            if hi5 and _is_alive(hi5) and hi5_t0 and (time.time() - hi5_t0) >= HI5_IDLE_TIMEOUT_SEC:
+            if (not committed) and hi5 and _is_alive(hi5) and hi5_t0 and (time.time() - hi5_t0) >= HI5_IDLE_TIMEOUT_SEC:
                 print("\n[KIOSK] HI5 idle timeout → killing HI5 and returning to RUN_KIOSK")
                 hi5 = _ensure_hi5_stopped(hi5)
                 hi5_t0 = None
@@ -276,11 +329,26 @@ def main():
                 time.sleep(POLL_SLEEP_KIOSK)
                 continue
 
-            # Otherwise, wait for HI5 to exit normally → then start pre-anim grace
+            # Otherwise, wait for HI5 to exit → decide by exit code whether the
+            # scan grace is warranted. hi5_final.py leaves the idle hourglass on
+            # the panel on its abort paths, so the dots aren't stuck on a stale
+            # HI-5 during whichever wait we pick here.
             if hi5 and hi5.poll() is not None:
-                print("\n[KIOSK] HI5 exited → WAIT for scan/anim (pre-anim grace starts)")
+                rc = hi5.returncode
                 hi5_t0 = None
                 hi5_last_log_t = 0.0
+
+                if rc == HI5_EXIT_IDLE_ABORT:
+                    # Nobody was ever there — no QR was shown, so nothing to
+                    # scan. Go straight back to attract instead of burning
+                    # SCAN_GRACE_SEC staring at an ended stage.
+                    print(f"\n[KIOSK] HI5 aborted (rc={rc}, no presence) → skipping scan grace, back to RUN_KIOSK")
+                    hi5 = _ensure_hi5_stopped(hi5)
+                    STATE = "RUN_KIOSK"
+                    time.sleep(POLL_SLEEP_KIOSK)
+                    continue
+
+                print(f"\n[KIOSK] HI5 exited (rc={rc}) → WAIT for scan/anim (pre-anim grace starts)")
                 STATE = "WAIT_ANIM"
                 pre_anim_mode      = True
                 dwell_elapsed      = 0.0

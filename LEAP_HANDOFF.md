@@ -590,6 +590,108 @@ on). Orientation came out right way up as authored, so
 remounted. Preview without hardware:
 `python3 kiosk/hourglass.py --cycle 6 --fps 4`.
 
+## Stale HI-5 left on the panel after an abort (2026-08-03)
+
+**Symptom:** logs said `[KIOSK] HI5 exited → WAIT for scan/anim` and then sat
+on `[WAIT] pre-anim 34.9/120.0`, but the panel still physically showed the
+HI-5 outline — no hourglass — for the whole two minutes.
+
+**Not a bug in one place; three things stacked:**
+
+1. Flipdots are bistable. The dots hold their last position with no power and
+   no refresh, so the last frame written stays *mechanically* on the panel
+   until some other process overwrites it. There is no "off" to fall back to.
+2. `hi5_final.py`'s abort path exited without drawing anything — it logged,
+   closed the serial port and left its half-drawn HI-5 outline on the dots.
+3. Nothing writes to the panel during `WAIT_ANIM`. The hourglass belongs to
+   `attract_leap.py`, which only runs in `RUN_KIOSK`, and `WAIT_ANIM`'s
+   pre-anim grace is `SCAN_GRACE_SEC` = **120s** long.
+
+Worse, `run_kiosk.py` couldn't tell the two HI-5 exits apart — success (which
+chains into `qr_works.py`) and idle-abort both exited 0 — so an abort, where
+by definition nobody is standing there to scan anything, still bought the full
+two-minute hold.
+
+**Both fixed:**
+
+- `hi5_final.py` now exits **3** (`EXIT_IDLE_ABORT`) on both abort paths (the
+  `IDLE_ABORT_SEC` no-presence one and the no-`pose`-block/old-Beelink-sender
+  one). Plain 0 still means "ran to completion" and still earns the grace.
+  `run_kiosk.py` reads the code (`HI5_EXIT_IDLE_ABORT`, env-overridable) and
+  on 3 goes straight back to `RUN_KIOSK`, skipping the grace entirely.
+- `hi5_final.py`'s `draw_idle_handoff_frame()` draws `hourglass.py`'s **t=0**
+  frame before exiting, so the panel never sits on an ended stage's frame.
+  t=0 is deliberate: `attract_leap.py` calls `idle.reset()` on each return to
+  idle, so a full glass is exactly the frame it draws a moment later —
+  seamless handoff rather than a blank.
+
+**Polarity trap worth knowing** (it bit nothing here only because it was
+checked): `hi5_final.py` and `attract_leap.py` read the *same* `WHITE_VAL` env
+var with **opposite** meanings — ink is `BLACK_VAL` in the former, `WHITE_VAL`
+in the latter — and they only agree while both are left at their opposite
+defaults (`1` and `0`). Setting `WHITE_VAL` globally inverts one of them. So
+`draw_idle_handoff_frame()` deliberately does *not* reuse `hi5_final.py`'s
+own constants; it maps ink with `attract_leap.py`'s rule and default, and was
+verified bit-identical to what `attract_leap.py` packs with `WHITE_VAL` unset,
+`0`, and `1`.
+
+**Verified** (2026-08-03, on the Pi, service was already stopped):
+`IDLE_ABORT_SEC=3` run of `hi5_final.py` with no UDP feed → exits 3, hourglass
+reaches the panel, no handoff-frame warning. `run_kiosk.py` driven with stub
+attract/HI-5 scripts → rc=3 logs `HI5 aborted (rc=3, no presence) → skipping
+scan grace` with zero `[WAIT]` lines and relaunches attract immediately; rc=0
+logs `HI5 exited (rc=0)` and still serves the full pre-anim grace before
+returning. Not yet watched end-to-end on the real panel with a live Beelink
+feed — that's the one thing left to eyeball.
+
+## Stage timings retuned + the QR-truncation trap (2026-08-03)
+
+`HI5_IDLE_TIMEOUT_SEC` **120s → 100s** (`run_kiosk.py`). That's the outer cap on
+the hi-5 stage: how long someone can stand there without completing the palm
+hold. `SCAN_GRACE_SEC` stays **120s** — deliberately different, because that
+one is the QR scanning window and a real visitor needs the time.
+
+Briefly set to 60s, then raised to 100s once the intro was measured: the
+`MESSAGES` scroll in `hi5_final.py` runs **~38s** (20.7s for "I AM A FUTURE
+DONATION MACHINE", 10.5s for "TO LEARN MORE", 5.1s for "HI-5", plus the big
+"HI" and palm settle) *before* palm detection starts, and that comes out of
+this same budget. 60s left only ~22s of real interaction time; 100s leaves
+~62s. If this cap ever needs to come down again, shorten the intro first —
+`SCROLL_DELAY=0.05` halves the scroll, or drop a line from `MESSAGES`.
+
+**Worth knowing: `SCAN_GRACE_SEC` *is* the QR display duration.** `qr_works.py`
+draws the QR and exits in well under a second; it doesn't hold anything. The
+QR stays up only because flipdots are bistable and nothing else writes to the
+panel during `WAIT_ANIM` — the same physics as the stale-HI-5 bug above. So
+"how long is the QR up for" is tuned by `SCAN_GRACE_SEC` and nothing else.
+
+**The trap the 60s change exposed:** `HI5_IDLE_TIMEOUT_SEC` counts from when
+`run_kiosk.py` *spawned* HI5, and `hi5_final.py` stays alive through the
+"SCAN ME" card (3s) and `qr_works.py` (~0.6s) — `qr_works.py` runs as its
+child. So completing the palm hold within ~3.6s of the cap got the visitor's
+QR killed a moment after they earned it. This was latent at 120s; halving it
+made the window far easier to hit.
+
+**Fix — a commit marker.** `hi5_final.py` touches `HI5_COMMIT_PATH`
+(`/tmp/hi5_committed`) the instant the palm hold completes. Past that point
+it's the QR flow, not an idle stage, so `run_kiosk.py` stops enforcing the cap
+(logs `[HI5] committed → QR flow running; idle cap suspended`). `run_kiosk.py`
+deletes the marker before every spawn, so a leftover from one visitor can't
+disarm the cap for the next.
+
+**Verified** (2026-08-03, stubs, cap forced to 4–5s): commit at 4.5s with a 5s
+cap → survived 6 more seconds and exited cleanly into the grace, where before
+it would have been killed at 5s. Never-commits stub → still capped and killed
+as intended. Real-hardware run still pending (no Leap feed at the time).
+
+**New: `kiosk/check_feed.py`.** Run it before `run_kiosk.py` to confirm the
+Beelink's UDP feed is actually arriving. No feed = the kiosk silently never
+detects anyone, which looks exactly like a broken sensor or a bad threshold,
+so this rules the network out first. It reports packet rate, hands, and
+whether the `pose` block is present (its absence = old sender on the Beelink,
+which aborts the hi-5 stage by design). It binds 5111 itself, so nothing else
+may hold the port while it runs.
+
 ## Not yet done / open ends
 
 - **Orientation is now confirmed**: `PROJECT_AXES=x,z` + `GRID_ROTATE=180`

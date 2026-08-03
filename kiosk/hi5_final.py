@@ -4,8 +4,14 @@ HI-5 palm interactor — presence-aware edition
 
 Adds:
 - Presence → auto-open after ASSUME_OPEN_SEC (default 5s)
-- No presence → exit after IDLE_ABORT_SEC (default 5s) so run_kiosk can relaunch
+- No presence → exit after IDLE_ABORT_SEC (default 30s) so run_kiosk can relaunch
 - Motion-based presence (EMA over downsampled luminance) in addition to hand landmarks
+
+Exit codes: 0 = ran to completion (the success path, which chains into
+NEXT_SCRIPT/qr_works.py); EXIT_IDLE_ABORT (3) = gave up with nobody there.
+run_kiosk.py skips its post-HI5 scan grace on 3 — see the constant's comment.
+Either way we leave the idle hourglass on the panel on the way out, because
+flipdots hold their last frame mechanically (see draw_idle_handoff_frame).
 
 Common env:
   WHITE_VAL ("1"), FLIPDOT_SERIAL ("/dev/ttyS0"), FLIPDOT_BAUD ("57600")
@@ -212,6 +218,21 @@ HYST_THRESH      = float(os.getenv("HYST_THRESH", "0.5"))#tighten this to a high
 ASSUME_OPEN_SEC  = float(os.getenv("ASSUME_OPEN_SEC", "5.0"))
 IDLE_ABORT_SEC   = float(os.getenv("IDLE_ABORT_SEC", "30"))
 
+# Exit code telling run_kiosk.py "I gave up; nobody was ever here". It skips
+# its post-HI5 scan grace on this code, because that grace only exists to give
+# a real visitor time to scan the QR — and on this path there is no visitor
+# and no QR. Plain exit 0 still means "ran to completion" (the success path,
+# which chains into qr_works.py) and still earns the full grace.
+EXIT_IDLE_ABORT  = 3
+
+# Touched the moment the palm hold completes, i.e. the moment we commit to the
+# QR flow. run_kiosk.py's HI5_IDLE_TIMEOUT_SEC counts from when it *spawned*
+# us, and we stay alive through the "SCAN ME" card and qr_works.py — so
+# without this, finishing the hold just before that cap expires gets us killed
+# mid-QR. run_kiosk.py stops enforcing the cap once this file appears; it
+# deletes it before each spawn, so a leftover can't disarm a later run.
+HI5_COMMIT_PATH  = os.getenv("HI5_COMMIT_PATH", "/tmp/hi5_committed")
+
 PALM_JSON         = os.getenv("PALM_JSON", os.path.join(SCRIPT_DIR, "..", "assets", "palm_combo.json"))
 
 # Logging (NEW)
@@ -263,6 +284,41 @@ def fill_canvas(val: int):
 def clear_white():
     print(f"[HI5] cleared {time.time():.3f}s → drawing big HI…intro text....")
     fill_canvas(WHITE_VAL)
+
+def draw_idle_handoff_frame():
+    """Leave the panel on the idle hourglass instead of a stale HI-5 outline.
+
+    Flipdots are bistable: the dots physically hold their last position with
+    no power and no refresh, so whatever we sent last stays mechanically on
+    the panel until some *other* process writes over it. On the abort paths
+    we're about to exit and close the serial port, and attract_leap.py takes
+    a moment to come back up — without this the panel sits on a half-drawn
+    HI-5 belonging to a stage that already ended.
+
+    Drawing hourglass.py's t=0 frame (rather than blanking) means the handoff
+    to attract_leap.py's idle animation is seamless: it resets to a full glass
+    on each return to idle, so its first frame is this same frame.
+
+    Polarity: frame_at() returns truthy for *ink* (walls and sand). Deliberately
+    do NOT reuse this file's WHITE_VAL/BLACK_VAL here — hi5_final.py and
+    attract_leap.py read the same WHITE_VAL env var with opposite meanings
+    (ink=BLACK_VAL here, ink=WHITE_VAL there; see attract_leap.py's docstring),
+    and they only agree while both are left at their opposite defaults. Since
+    this is attract_leap.py's artwork, map it with attract_leap.py's rule and
+    default, so the frame we leave is bit-identical to the one it draws a
+    moment later no matter how WHITE_VAL is set.
+
+    Best-effort: any failure here must not stop us exiting, since a stuck HI5
+    is worse than a stale frame.
+    """
+    try:
+        from hourglass import frame_at  # sits next to this file
+        ink_bit = int(os.getenv("WHITE_VAL", "0"))  # attract_leap.py's rule
+        bg_bit  = 1 - ink_bit
+        send_frame_to_flipdot([[ink_bit if cell else bg_bit for cell in row]
+                               for row in frame_at(0.0)])
+    except Exception as e:
+        print(f"[HI5] idle handoff frame failed ({e}); leaving panel as-is")
 
 # ============== Text (5x7) ==============
 def blank(fill=BLACK_VAL):
@@ -647,8 +703,11 @@ def main():
                     _log("[HI5] ABORT: hands arriving with no 'pose' block — the Beelink "
                          "is running an old leap_sender.py (see LEAP_HANDOFF.md). "
                          "Exiting to kiosk.")
+                    # Same deal as the idle abort: nobody got a QR here either,
+                    # so don't make the kiosk sit out the scan grace.
+                    draw_idle_handoff_frame()
                     maybe_close_serial()
-                    sys.exit(0)
+                    sys.exit(EXIT_IDLE_ABORT)
 
         # ---- Presence decision
         # Presence must survive the gaps between packets (unlike open-palm
@@ -730,8 +789,9 @@ def main():
         # ---- Idle abort: no humans for ≥ IDLE_ABORT_SEC → exit
         if absence_cont >= IDLE_ABORT_SEC:
             _log(f"[HI5] ABORT: no presence for {absence_cont:.1f}s → exit to kiosk")
+            draw_idle_handoff_frame()
             maybe_close_serial()
-            sys.exit(0)
+            sys.exit(EXIT_IDLE_ABORT)
 
         # ---- Render
         if effective_open:
@@ -746,6 +806,13 @@ def main():
             if TUI: tui_print_preview(True, progress, presence_now)
             if progress >= 1.0:
                 _log("[HI5] SUCCESS: filled to 100% — chaining to NEXT_SCRIPT")
+                # Tell run_kiosk.py to stop enforcing its idle cap — from here
+                # on we're the QR flow, not an idle hi-5 stage.
+                try:
+                    with open(HI5_COMMIT_PATH, "w") as f:
+                        f.write(str(time.time()))
+                except Exception as e:
+                    print(f"[HI5] could not write commit marker ({e})")
                 satisfied = True
                 break
         else:
