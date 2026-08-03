@@ -43,6 +43,16 @@ does NOT push new JS to a browser tab that's already open. Hard-refresh
 or the two panes can look inconsistent for a reason that has nothing to
 do with the actual code.
 
+**Update (2026-08-03): the Pi now has a static IP and the Beelink no longer
+prompts for it.** A new Prolink DL-7203E LTE mobile hotspot (SIM-based,
+carried with the physical setup so the network is the same everywhere the
+kiosk goes) replaced whatever WiFi the Pi used before. The Pi's `wlan0` is
+now pinned to `192.168.1.102` (survives reboot), and `beelink/startup_leap.bat`
+hardcodes `RPI_HOST=192.168.1.102` instead of asking for it interactively at
+launch. See "Network setup" below for the full details — this makes the old
+`$env:RPI_HOST = "172.20.10.3"` line further down stale; ignore it in favor
+of the static value.
+
 **Where things stand on orientation (confirmed 2026-08-01):**
 - `PROJECT_AXES=x,z` (on the Beelink) gives a correctly *shaped* hand —
   fingers spread out and distinguishable, not a collapsed blob. This was
@@ -170,6 +180,7 @@ old landmark/bbox test and still has the over-triggering bug — port the
 | File | Runs on | Purpose |
 |---|---|---|
 | `beelink/leap_sender.py` | Beelink | Reads Leap frames via `leap` bindings, reshapes to the 21-point schema, sends UDP. Tracked here for reference, but **not synced automatically** — the Beelink runs its own copy at `C:\Users\Creative Machine 02\Desktop\leapc-python-bindings-main\leap_sender.py`; copy this file over by hand after editing it here. |
+| `beelink/startup_leap.bat` | Beelink | Sets env vars (`RPI_HOST` hardcoded to `192.168.1.102`, `PROJECT_AXES`, `LEAPSDK_INSTALL_LOCATION`), activates the `leapenv` venv, and runs `leap_sender.py` — this is what the "STart up LEAP" Task Scheduler task actually launches. Same manual-copy caveat as `leap_sender.py` — live copy is at `C:\Users\Creative Machine 02\Desktop\leapc-python-bindings-main\startup_leap.bat`, copy by hand after editing here. See "Autostart on the Beelink" below. |
 | `leap_receiver.py` | Pi | Terminal readout — hand type, open/closed, latency, packet rate |
 | `leap_visualizer.py` | Pi | Browser view (`http://<pi-ip>:8090`) — raw capture + simulated flipdot preview, side by side |
 | `leap_flipdot_preview.py` | Pi | Draws the skeleton directly on the physical panel — **confirmed working** |
@@ -215,7 +226,7 @@ old landmark/bbox test and still has the over-triggering bug — port the
 cd "C:\Users\Creative Machine 02"
 leapenv\Scripts\activate
 $env:LEAPSDK_INSTALL_LOCATION = "C:\Program Files (x86)\Steam\steamapps\common\Ultraleap Gemini\LeapSDK"
-$env:RPI_HOST = "172.20.10.3"   # confirm this hasn't changed — check with `hostname -I` on the Pi
+$env:RPI_HOST = "192.168.1.102" # static now — see "Network setup" below, shouldn't change
 $env:PROJECT_AXES = "x,z"       # current mount (vertical, right edge, lens outward) — gives correct SHAPE, see note below
 cd "C:\Users\Creative Machine 02\Desktop\leapc-python-bindings-main"
 python leap_sender.py
@@ -607,10 +618,91 @@ remounted. Preview without hardware:
   didn't): `flipdot-api.service` is enabled and running, `runkiosk.service`
   exists but is currently stopped. Both are pointed at this repo by
   `.d/override.conf` drop-ins — see "Starting the kiosk itself" in the
-  cheat sheet. The **Beelink side is still fully manual**: nothing
-  autostarts `leap_sender.py`, so a reboot there silently leaves the kiosk
-  blind, and that's the real remaining autostart gap.
+  cheat sheet. **The Beelink now autostarts too** (this line, from the
+  2026-08-01 audit, said it was still fully manual — that was true when it
+  was written, but a Task Scheduler task was set up ~10 minutes later that
+  same evening; see "Autostart on the Beelink" below for what's actually
+  running there and its one remaining caveat: it requires a logged-in
+  session, so it's not fully unattended).
 - See "Wired into the kiosk" above for the current integration's open ends.
   The hi-5 gesture gate is no longer among them — it's confirmed on real
   hardware at its shipped defaults; see "Hi-5 detection rebuilt on Leap
   pose signals".
+
+## Network setup (2026-08-03)
+
+The kiosk now runs on a dedicated, portable LTE hotspot instead of whatever
+WiFi happened to be available at a venue — this is what makes a hardcoded
+`RPI_HOST` on the Beelink sane instead of something that breaks the moment
+the setup moves.
+
+- **Prolink DL-7203E** (SIM-based LTE mobile router, SSID `Prolink_E8EC`) is
+  carried with the physical setup everywhere it goes, so the Pi and Beelink
+  always join the *same* network regardless of venue — the network doesn't
+  depend on venue WiFi at all.
+- **Pi (`wlan0`) has a static IP**, set via NetworkManager (Raspberry Pi OS
+  Bookworm default network stack):
+  ```bash
+  sudo nmcli connection modify "Prolink_E8EC" \
+    ipv4.addresses 192.168.1.102/24 \
+    ipv4.gateway 192.168.1.1 \
+    ipv4.dns "192.168.1.1 8.8.8.8" \
+    ipv4.method manual
+  sudo nmcli connection up "Prolink_E8EC"
+  ```
+  Confirmed via `ip -4 addr show wlan0` showing `valid_lft forever` (not a
+  DHCP lease), and confirmed to survive a reboot.
+- **Router's DHCP pool narrowed** from `192.168.1.100`–`200` to
+  `192.168.1.110`–`200` (Advanced Settings → Router, on the Prolink's admin
+  page at `192.168.1.1`) so `.102` can never be dynamically handed out to
+  another device — this firmware has no MAC-based DHCP reservation feature,
+  so shrinking the pool below the Pi's static IP is the practical
+  equivalent. Confirmed working: two other devices reconnecting afterward
+  picked up `.110`/`.111`, not `.102`.
+- **`beelink/startup_leap.bat`** hardcodes `RPI_HOST=192.168.1.102` instead
+  of prompting for it (`set /p RPI_HOST=...`, previously) — see the Files
+  table above and "Autostart on the Beelink" below.
+
+## Autostart on the Beelink
+
+**What's actually running:** a Windows Task Scheduler task named
+**"STart up LEAP"** (General tab: triggers "At log on of any user", runs
+under the `Creative Machine 02` account, **"Run only when user is logged
+on"**) launches `beelink/startup_leap.bat`, which sets env vars and runs
+`leap_sender.py`. This requires the Beelink to actually reach a logged-in
+desktop session before the sensor feed starts — it is not a fully
+unattended/headless boot.
+
+**Not currently used — a drafted, untested alternative:**
+`beelink/leap_sender_autostart.ps1` + `beelink/install_autostart_task.ps1`
+were written to make `leap_sender.py` start with no login and no clicking
+at all — a Scheduled Task firing "At startup" (before any user signs in),
+running as SYSTEM, wrapping `leap_sender.py` in a reachability-check +
+restart loop. These files exist in the repo but **were never installed on
+the Beelink** — Task Scheduler only shows "STart up LEAP" (the `.bat`
+approach above), no task named "QRiousGiving LeapSender" (what
+`install_autostart_task.ps1` would register). Worth revisiting if the
+kiosk ever needs to survive an unattended power-cycle with nobody around to
+log in, but treat it as unverified until then:
+
+1. Copy both scripts to
+   `C:\Users\Creative Machine 02\Desktop\leapc-python-bindings-main\`.
+2. Open PowerShell **as Administrator**, `cd` there, run
+   `.\install_autostart_task.ps1` once.
+3. Test without rebooting: `Start-ScheduledTask -TaskName "QRiousGiving LeapSender"`,
+   then tail the log: `Get-Content .\leap_sender_autostart.log -Tail 20 -Wait`.
+4. Reboot to confirm it comes up unattended.
+
+To remove: `schtasks /Delete /TN "QRiousGiving LeapSender" /F`.
+
+**Unverified assumption (if this path is ever picked up):** this only works
+fully unattended if Ultraleap's Gemini tracking service itself starts
+without a logged-in session. Check `services.msc` for an Ultraleap/Leap
+Motion tracking service set to "Automatic" startup type. If Gemini turns
+out to only run as a tray app tied to a signed-in desktop session, the
+fallback is Windows auto-login (`netplwiz` → uncheck "users must enter a
+password" — or the `AutoAdminLogon` registry keys under
+`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon` for a
+password-less account) so the desktop session exists before the task's
+script runs. Also note its `$env:RPI_HOST = "172.20.10.3"` default is
+stale — update to `192.168.1.102` if this ever gets installed for real.
