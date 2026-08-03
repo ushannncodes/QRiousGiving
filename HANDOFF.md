@@ -259,8 +259,9 @@ cam_v2.py (pose detection) + attract_v2.py (silhouette)
 | `kiosk/qr_works.py` | QR code display |
 | `kiosk/DFRobot_HuskyLens.py` | HuskyLens adapter (hand+pose landmarks) |
 | `animations/anim.py` | Countdown + random anim + THANK YOU |
+| `animations/loading.py` | Scrolling message (or draining ring) + random anim + THANK YOU |
 | `animations/rand_anim/` | Random animations (sunflower etc.) |
-| `api/flipdot-api.py` | HTTP API that queues and runs anim.py |
+| `api/flipdot-api.py` | HTTP API that queues and runs the animation scripts |
 | `simulator/flipdot_simulator.py` | Web-based flipdot display at :5050 |
 
 ## Quick diagnostics

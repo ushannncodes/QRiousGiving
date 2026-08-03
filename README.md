@@ -32,9 +32,9 @@ shows a QR code so they can donate.
   HuskyLens-based sensor pipeline — no longer used by default, kept for
   reference.
 - `animations/` — flipdot animations triggered through the API (`anim.py`,
-  `rand_anim/`).
+  `loading.py`, `rand_anim/`).
 - `api/` — `flipdot-api.py`, a small Flask service that queues/runs
-  animations.
+  animations, triggered by buttons on the donation website.
 - `assets/` — static assets (palm outline mask, images).
 - `legacy/` — old/dead code kept for reference; not part of the live
   pipeline.
@@ -61,6 +61,24 @@ The flipdot animation API runs separately:
 ```
 python3 api/flipdot-api.py
 ```
+
+Buttons on the Framer donation site POST to `/trigger` with a `sequence`
+name and the `X-Trigger-Secret` header (matching `TRIGGER_SECRET` on the
+Pi). `SCRIPTS` in `flipdot-api.py` maps each name to a script plus any env
+it should run with:
+
+| sequence | plays |
+|----------|-------|
+| `anim_py` | `animations/anim.py` — 5-4-3-2-1 countdown, random anim, THANK YOU |
+| `loading_py` | `animations/loading.py` — scrolling message (or countdown ring), random anim, THANK YOU |
+| `loading_text_py` | same as above, forced to the scrolling-message opener |
+
+One press queues one run; a single worker thread plays them back-to-back so
+only one script ever owns the serial port. The `loading_*` sequences are
+listed in `EXCLUSIVE_JOBS`, so a press arriving while one is already running
+is rejected with `409` rather than queued — that keeps the panel in sync
+with whoever is standing in front of it instead of building a backlog.
+Check `/status` for the running job and queue depth.
 
 ## Testing without hardware
 
