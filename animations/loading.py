@@ -4,13 +4,15 @@ loading.py — a one-minute loading ring, then a random animation, then the than
 
 One cycle:
   1. An opener, either (LOADING_STYLE):
+     'ring' — a full ring is drawn, then eaten away starting at 12 o'clock and
+       travelling anti-clockwise, emptying over RING_SECONDS (60). Same radius
+       and thickness as anim.py's 5-4-3-2-1 countdown ring. The seconds left
+       count down 60..0 in the middle of it, in the same 5x7 font as the
+       'text' opener.
      'text' — TEXT_MESSAGE scrolls right-to-left TEXT_PASSES times, in the same
        5x7 font, spacing and centred row as hi5_final.py's
        "I AM A FUTURE DONATION MACHINE". 3 passes of the default message
        is about 43s.
-     'ring' — a full ring is drawn, then eaten away starting at 12 o'clock and
-       travelling anti-clockwise, emptying over RING_SECONDS (60). Same radius
-       and thickness as anim.py's 5-4-3-2-1 countdown ring, minus the digits.
   2. Exactly one random script from rand_anim/ runs — the same picker anim.py
      uses, so the two never repeat each other's last pick.
   3. The static THANK YOU card holds for END_CARD_TOTAL_SEC (same as anim.py).
@@ -21,7 +23,7 @@ One cycle:
 Env vars:
   SERIAL_PORT         /dev/ttyS0  panel serial port
   BAUD_RATE           57600
-  LOADING_STYLE       text        'text' or 'ring' — which opener to play
+  LOADING_STYLE       ring        'ring' or 'text' — which opener to play
   TEXT_MESSAGE        EVERY $ HELPS!
   TEXT_PASSES         3           how many times the message scrolls past
   SCROLL_STEP         1           columns per step (as hi5_final.py)
@@ -32,6 +34,7 @@ Env vars:
   RING_THICKNESS      3           matches COUNTDOWN_RING_THICKNESS in anim.py
   RING_MODE           drain       'drain' starts full and erases it, 'fill' draws it in
   RING_HOLD_SEC       0.5         hold the full ring before the drain, and the empty panel after
+  RING_DIGITS         1           0 = bare ring, no seconds-left number inside it
   END_CARD_TOTAL_SEC  3.0         thank-you hold (same default as anim.py)
   RAND_ANIM_DIR       ./rand_anim (read by anim.py's picker)
   FORCE_ANIM          -           force one rand_anim script by name/glob
@@ -62,7 +65,7 @@ HEIGHT, WIDTH = anim.HEIGHT, anim.WIDTH
 SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/ttyS0")
 BAUD_RATE = int(os.getenv("BAUD_RATE", "57600"))
 
-LOADING_STYLE = os.getenv("LOADING_STYLE", "text").strip().lower()
+LOADING_STYLE = os.getenv("LOADING_STYLE", "ring").strip().lower()
 
 TEXT_MESSAGE = os.getenv("TEXT_MESSAGE", "EVERY $ HELPS!")
 TEXT_PASSES = int(os.getenv("TEXT_PASSES", "3"))
@@ -76,6 +79,7 @@ RING_THICKNESS = int(os.getenv("RING_THICKNESS", str(anim.COUNTDOWN_RING_THICKNE
 RING_MODE = os.getenv("RING_MODE", "drain").strip().lower()
 RING_HOLD_SEC = float(os.getenv("RING_HOLD_SEC", "0.5"))
 RING_TICK_SEC = float(os.getenv("RING_TICK_SEC", "0.05"))  # how often to re-check for a changed frame
+RING_DIGITS = os.getenv("RING_DIGITS", "1") not in ("0", "false", "False", "")
 
 END_CARD_TOTAL_SEC = float(os.getenv("END_CARD_TOTAL_SEC", "3.0"))
 REFRESH_SEC = float(os.getenv("REFRESH_SEC", "0.5"))
@@ -185,34 +189,55 @@ def render_text_frame(strip, offset):
     return frame
 
 
-def render_ring(frac_visible):
+def blit_strip_centered(frame, strip):
+    """Drop a text_strip bitmap in the middle of the panel, centred on both axes."""
+    h, w = strip.shape
+    top = HEIGHT // 2 - h // 2
+    left = WIDTH // 2 - w // 2
+    for yy in range(h):
+        fy = top + yy
+        if not (0 <= fy < HEIGHT):
+            continue
+        for xx in range(w):
+            fx = left + xx
+            if 0 <= fx < WIDTH and strip[yy, xx]:
+                frame[fy, fx] = INK
+    return frame
+
+
+def render_ring(frac_visible, label=None):
     """
     The ring with `frac_visible` of it drawn, 1.0 being the closed circle.
 
-    This is anim.py's render_countdown_frame arc, minus the digit: same centre,
-    radius, brush and angular step, so the shape is pixel-identical to the
-    5-4-3-2-1 countdown ring. The arc always starts at 12 o'clock, so shrinking
-    it opens a gap there that grows anti-clockwise around the face.
+    This is anim.py's render_countdown_frame arc: same centre, radius, brush and
+    angular step, so the shape is pixel-identical to the 5-4-3-2-1 countdown
+    ring. The arc always starts at 12 o'clock, so shrinking it opens a gap there
+    that grows anti-clockwise around the face.
+
+    `label` is the seconds-left number, drawn in the middle in the same 5x7 font
+    the text opener uses. Two digits are 11x7, well inside the ring's ~19px bore,
+    so the number never touches the arc.
     """
     frame = np.full((HEIGHT, WIDTH), BG, dtype=np.uint8)
     cy, cx = HEIGHT // 2, WIDTH // 2
     r = RING_RADIUS
 
     arc_len = max(0.0, min(1.0, frac_visible)) * 2.0 * math.pi
-    if arc_len <= 0:
-        return frame
+    if arc_len > 0:
+        a = -math.pi / 2.0
+        a_end = a + arc_len
+        step = (1.0 / max(6.0, r * 8.0)) * 2.0 * math.pi
+        while a <= a_end + 1e-6:
+            yy = int(round(cy + r * math.sin(a)))
+            xx = int(round(cx + r * math.cos(a)))
+            for dy, dx in _BRUSH:
+                y, x = yy + dy, xx + dx
+                if 0 <= y < HEIGHT and 0 <= x < WIDTH:
+                    frame[y, x] = INK
+            a += step
 
-    a = -math.pi / 2.0
-    a_end = a + arc_len
-    step = (1.0 / max(6.0, r * 8.0)) * 2.0 * math.pi
-    while a <= a_end + 1e-6:
-        yy = int(round(cy + r * math.sin(a)))
-        xx = int(round(cx + r * math.cos(a)))
-        for dy, dx in _BRUSH:
-            y, x = yy + dy, xx + dx
-            if 0 <= y < HEIGHT and 0 <= x < WIDTH:
-                frame[y, x] = INK
-        a += step
+    if label:
+        blit_strip_centered(frame, text_strip(label))
     return frame
 
 
@@ -236,16 +261,29 @@ def hold(ser, frame, seconds):
         time.sleep(min(REFRESH_SEC, remaining))
 
 
+def seconds_label(remaining):
+    """
+    The number to show in the ring's middle: whole seconds left, 60 down to 0.
+
+    Rounding up means each number gets a full second on the panel — 60 is up for
+    the first second, 1 for the last — and 0 lands exactly as the ring empties,
+    where the closing RING_HOLD_SEC keeps it visible for a beat.
+    """
+    if not RING_DIGITS:
+        return None
+    return str(int(math.ceil(max(0.0, remaining) - 1e-9)))
+
+
 def play_ring(ser):
     """Empty (or close) the ring over RING_SECONDS. False if interrupted."""
     draining = RING_MODE == "drain"
-    log.info("ring: %s over %.0fs, r=%g thickness=%d",
+    log.info("ring: %s over %.0fs, r=%g thickness=%d digits=%s",
              "draining" if draining else "filling", RING_SECONDS,
-             RING_RADIUS, RING_THICKNESS)
+             RING_RADIUS, RING_THICKNESS, "on" if RING_DIGITS else "off")
 
     # Show the starting state first — draining, that's the complete ring, which
     # is the whole point; the clock only starts once it is up.
-    start_frame = render_ring(1.0 if draining else 0.0)
+    start_frame = render_ring(1.0 if draining else 0.0, seconds_label(RING_SECONDS))
     hold(ser, start_frame, RING_HOLD_SEC)
     if should_stop():
         return False
@@ -255,11 +293,14 @@ def play_ring(ser):
     while True:
         if should_stop():
             return False
-        progress = min(1.0, (time.time() - t0) / RING_SECONDS)
-        frame = render_ring(1.0 - progress if draining else progress)
-        # Send only when the dots actually change. The ring only has 73 distinct
-        # states, so a 60s drain pushes 73 frames — one visible step every 0.8s —
-        # instead of clattering the whole panel at frame rate to no effect.
+        elapsed = time.time() - t0
+        progress = min(1.0, elapsed / RING_SECONDS)
+        frame = render_ring(1.0 - progress if draining else progress,
+                            seconds_label(RING_SECONDS - elapsed))
+        # Send only when the dots actually change. The ring itself only has 73
+        # distinct states over a 60s drain, and the number changes once a second,
+        # so this pushes ~130 frames instead of clattering the whole panel at
+        # frame rate to no effect.
         if not np.array_equal(frame, last):
             send(ser, frame)
             last = frame

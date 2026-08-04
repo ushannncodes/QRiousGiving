@@ -70,8 +70,8 @@ it should run with:
 | sequence | plays |
 |----------|-------|
 | `anim_py` | `animations/anim.py` — 5-4-3-2-1 countdown, random anim, THANK YOU |
-| `loading_py` | `animations/loading.py` — scrolling message (or countdown ring), random anim, THANK YOU |
-| `loading_text_py` | same as above, forced to the scrolling-message opener |
+| `loading_py` | `animations/loading.py` — 60s draining ring counting 60..0, random anim, THANK YOU |
+| `loading_text_py` | same as above, with a scrolling message in place of the ring opener |
 
 One press queues one run; a single worker thread plays them back-to-back so
 only one script ever owns the serial port. The `loading_*` sequences are
