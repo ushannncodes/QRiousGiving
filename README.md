@@ -7,7 +7,7 @@ shows a QR code so they can donate.
 ## Hardware
 
 - Raspberry Pi
-- Flipdot display: 4 stacked 28x7 panels = 28x28, driven over serial
+- Flipdot display: 2 stacked 28x7 panels = 28x28, driven over serial
   (`FLIPDOT_SERIAL`, default `/dev/ttyS0`). Wire protocol, one packet per
   panel: `[0x80, 0x83, <panel addr>, <28 column bytes>, 0x8F]`.
 - Leap Motion Controller for hand tracking, for both presence/attract and
