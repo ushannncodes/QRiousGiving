@@ -4,6 +4,16 @@ An interactive flipdot-display kiosk: it notices someone nearby, shows a
 live tracking silhouette to draw them in, invites a hi-5/palm gesture, then
 shows a QR code so they can donate.
 
+### QRiousGiving V1 - featured in Singapore Design Week 2025
+
+<img width="581" height="380" alt="QRious Giving - HQ - 1" src="https://github.com/user-attachments/assets/a661054f-7261-4b0b-96ed-0779c3715746" />
+
+<img width="380" height="380" alt="QRious Giving - HQ - 11" src="https://github.com/user-attachments/assets/fe3c328a-9cc2-48c9-9cd2-cc9e90d7e307" />
+
+### QriousGiving V2 - featured in RE:PLAY, part of RE:INVENTION 
+
+<img width="408" height="500" alt="2026-08-23 16 02 04" src="https://github.com/user-attachments/assets/f00ed85e-748e-4727-a56a-c47144169b2f" />
+<img width="400" height="500" alt="IMG_9634" src="https://github.com/user-attachments/assets/b0535e13-e53e-4da3-8142-6743a287069a" />
 
 ## Hardware
 
