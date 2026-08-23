@@ -4,10 +4,11 @@ An interactive flipdot-display kiosk: it notices someone nearby, shows a
 live tracking silhouette to draw them in, invites a hi-5/palm gesture, then
 shows a QR code so they can donate.
 
+
 ## Hardware
 
 - Raspberry Pi
-- Flipdot display: 2 stacked 28x7 panels = 28x28, driven over serial
+- Flipdot display: 2x 28x14 modules (13.5mm dots) = 28x28, wired as 4x 28x7 addressable panels over serial, driven over serial
   (`FLIPDOT_SERIAL`, default `/dev/ttyS0`). Wire protocol, one packet per
   panel: `[0x80, 0x83, <panel addr>, <28 column bytes>, 0x8F]`.
 - Leap Motion Controller for hand tracking, for both presence/attract and
