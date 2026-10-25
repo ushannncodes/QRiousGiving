@@ -6,10 +6,6 @@ shows a QR code so they can donate.
 
 ### QRiousGiving V1 - featured in Singapore Design Week 2025
 
-**Our Design Story**
-
-<video src="https://youtu.be/fhSGzBHzpLw" width="100%" controls></video>
-
 <img width="581" height="380" alt="QRious Giving - HQ - 1" src="https://github.com/user-attachments/assets/a661054f-7261-4b0b-96ed-0779c3715746" />
 
 <img width="380" height="380" alt="QRious Giving - HQ - 11" src="https://github.com/user-attachments/assets/fe3c328a-9cc2-48c9-9cd2-cc9e90d7e307" />
